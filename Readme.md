@@ -63,10 +63,7 @@ text
 
 ## 🛠️ Installation
 
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/your-username/pakistan-legal-ai.git
+### 1. Clone the Repositorygit clone https://github.com/your-username/pakistan-legal-ai.git
 cd pakistan-legal-ai
 2. Create Virtual Environment
 bash
