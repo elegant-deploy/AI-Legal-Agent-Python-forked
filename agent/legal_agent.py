@@ -9,6 +9,9 @@ from chromadb.utils import embedding_functions
 from config.settings import settings
 from helper.token_tracker import track_token_usage_async
 
+# Cache for embedder to avoid reloading
+_embedder_cache = {}
+
 # ------------------ OpenRouter Config ------------------
 OPENROUTER_API_URL = settings.OPENROUTER_API_URL
 OPENROUTER_MODEL = settings.OPENROUTER_MODEL
@@ -41,7 +44,7 @@ class OpenRouterLLM(LLM):
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 2000
+            "max_tokens": 1500
         }
         try:
             resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
@@ -107,8 +110,15 @@ def get_collection_retriever(collection_name: str, k: int = 4):
     """Create a retriever for a specific collection"""
     client = create_chroma_client()
 
+    model_name = "all-MiniLM-L6-v2"
+    if model_name not in _embedder_cache:
+        from sentence_transformers import SentenceTransformer
+        _embedder_cache[model_name] = SentenceTransformer(model_name)
+    embedder = _embedder_cache[model_name]
+
     embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+        model_name=model_name,
+        model=embedder
     )
 
     try:
