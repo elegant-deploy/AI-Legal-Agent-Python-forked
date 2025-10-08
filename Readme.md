@@ -63,34 +63,26 @@ text
 
 ## 🛠️ Installation
 
-### 1. Clone the Repository
-🇵🇰 Pakistan AI Legal Assistant
-This project is an advanced Retrieval-Augmented Generation (RAG) system designed to provide accurate legal research assistance based on specific Pakistan legal documents. It uses a FastAPI backend, ChromaDB for vector storage, and an LLM accessed via the OpenRouter API for reasoning.
-
-🚀 Quick Start
-1. Setup Project
-git clone [https://github.com/your-username/pakistan-legal-ai.git](https://github.com/your-username/pakistan-legal-ai.git)
+### 1. Clone the Repositorygit clone https://github.com/your-username/pakistan-legal-ai.git
 cd pakistan-legal-ai
-
 2. Create Virtual Environment
+bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-
 3. Install Dependencies
+bash
 pip install -r requirements.txt
-
 4. Environment Configuration
-Create a .env file in the root directory and populate it with your API keys and configuration details:
+Create a .env file in the root directory:
 
+env
 CHROMA_API_KEY=your_chroma_api_key
 CHROMA_TENANT=your_chroma_tenant
 CHROMA_DATABASE=ai-legal-research-assistant
 OPENROUTER_API_KEY=your_openrouter_api_key
-
-💻 Usage
+🚀 Quick Start
 1. Ingest Legal Documents
-Use the ingestion script to load and process PDF documents into your ChromaDB vector store. Ensure your PDF files (e.g., Pakistan Penal Code.pdf, Traffic Laws.pdf) are available in the system.
-
+bash
 # Ingest Pakistan Penal Code
 python -c "
 from controllers.ingest_controller import ingest_pdf
@@ -102,70 +94,28 @@ python -c "
 from controllers.ingest_controller import ingest_pdf  
 ingest_pdf('Traffic Laws.pdf', force=True)
 "
-
 2. Start Development Server
+bash
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
 3. Access the API
-The API server will run on port 8000 by default.
-
 API Documentation: http://localhost:8000/docs
 
 Alternative Docs: http://localhost:8000/redoc
 
 📚 API Endpoints
 Legal Research Endpoints
-Method
-
-Endpoint
-
-Description
-
-POST
-
-/api/legal/query
-
-Submit legal queries to the RAG system.
-
-GET
-
-/api/legal/domains
-
-List supported legal domains for targeted queries.
-
-GET
-
-/api/legal/collections
-
-List available document collections in ChromaDB.
-
+Method	Endpoint	Description
+POST	/api/legal/query	Submit legal queries
+GET	/api/legal/domains	List supported legal domains
+GET	/api/legal/collections	List available document collections
 Document Management Endpoints
-Method
-
-Endpoint
-
-Description
-
-POST
-
-/api/ingest/pdf
-
-Upload and process new PDF documents.
-
-GET
-
-/api/ingest/collections
-
-List all available collections.
-
-DELETE
-
-/api/ingest/collection/{name}
-
-Delete a specific document collection.
-
+Method	Endpoint	Description
+POST	/api/ingest/pdf	Upload and process PDF documents
+GET	/api/ingest/collections	List all collections
+DELETE	/api/ingest/collection/{name}	Delete a collection
 💡 Usage Examples
 Legal Query Example
+python
 import requests
 
 response = requests.post(
@@ -177,8 +127,8 @@ response = requests.post(
 )
 
 print(response.json())
-
 PDF Ingestion Example
+python
 import requests
 
 with open('Family Laws.pdf', 'rb') as file:
@@ -189,57 +139,32 @@ with open('Family Laws.pdf', 'rb') as file:
     )
 
 print(response.json())
-
 🏷️ Supported Legal Domains
-Domain
-
-Keywords
-
-Description
-
-Traffic Law
-
-traffic, motor vehicle, driving, license, transport
-
-Road and vehicle regulations.
-
-Family Law
-
-family, marriage, divorce, inheritance, custody
-
-Personal and family matters.
-
-Corporate Law
-
-corporate, company, business, contract, partnership
-
-Business and commercial laws.
-
-PPC
-
-ppc, penal code, criminal, crime, punishment
-
-Pakistan Penal Code offenses.
-
+Domain	Keywords	Description
+Traffic Law	traffic, motor vehicle, driving, license, transport	Road and vehicle regulations
+Family Law	family, marriage, divorce, inheritance, custody	Personal and family matters
+Corporate Law	corporate, company, business, contract, partnership	Business and commercial laws
+PPC	ppc, penal code, criminal, crime, punishment	Pakistan Penal Code offenses
 🔧 Configuration
 ChromaDB Configuration
 The project uses ChromaDB Cloud for vector storage. Update your credentials in the environment variables:
 
+python
 CHROMA_API_KEY = "your_api_key_here"
 CHROMA_TENANT = "your_tenant_id_here" 
 CHROMA_DATABASE = "ai-legal-research-assistant"
-
 OpenRouter Configuration
 Configure your preferred language model:
 
+python
 OPENROUTER_MODEL = "deepseek/deepseek-r1-0528-qwen3-8b:free"
 # Alternative models:
 # "meta-llama/llama-3-70b-instruct"
 # "google/gemini-pro-1.5"
-
 🧪 Testing
 Run the test suite to ensure everything is working:
 
+bash
 # Run basic functionality tests
 python -m pytest tests/ -v
 
@@ -248,16 +173,16 @@ python -c "
 from controllers.legal_controller import test_legal_query
 test_legal_query('What is Section 302 of PPC?')
 "
-
 🚀 Deployment
 Production Deployment
+bash
 # Install production dependencies
 pip install -r requirements.txt
 
 # Start production server
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-
 Docker Deployment
+dockerfile
 FROM python:3.9-slim
 
 WORKDIR /app
@@ -266,24 +191,23 @@ RUN pip install -r requirements.txt
 
 COPY . .
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-
 📊 Monitoring
 Token Usage Tracking
 The system includes comprehensive token tracking:
 
+python
 from helper.token_tracker import TokenTracker
 
 tracker = TokenTracker()
 usage = tracker.get_usage_stats()
 print(f"Total tokens used: {usage['total_tokens']}")
-
 API Metrics
 Monitor API performance and usage through the built-in metrics endpoint:
 
+bash
 curl http://localhost:8000/api/metrics
-
 🤝 Contributing
-We welcome contributions! Please see our [Contributing Guide] for details.
+We welcome contributions! Please see our Contributing Guide for details.
 
 Fork the repository
 
@@ -301,9 +225,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 🆘 Support
 📧 Email: support@pakistanlegalai.com
 
-💬 Discussions: [GitHub Discussions]
+💬 Discussions: GitHub Discussions
 
-🐛 Bug Reports: [GitHub Issues]
+🐛 Bug Reports: GitHub Issues
 
 🙏 Acknowledgments
 OpenRouter for LLM API access
@@ -317,4 +241,7 @@ The Pakistan legal community for guidance and support
 <div align="center">
 Built with ❤️ for the Pakistan Legal Community
 
-</div>
+https://img.shields.io/twitter/follow/pakistanlegalai?style=social
+https://img.shields.io/github/stars/your-username/pakistan-legal-ai?style=social
+
+</div> ```
