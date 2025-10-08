@@ -1,0 +1,41 @@
+name: SQL-AI-Python Dev
+on:
+  push:
+    branches: [ dev, main ]
+
+jobs:
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy NodeJS App (Dev)
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          key: ${{ secrets.SSH_KEY }}
+          username: ${{ secrets.SSH_USERNAME }}
+          script: |
+            cd /mnt/ai-agent-python-dev
+            git checkout dev && git pull origin dev
+            # echo '${{secrets.DEV_ENV}}' > .env
+            source /mnt/ai-agent-python-dev/.venv/bin/activate
+            pip install -r requirements.txt
+            sudo systemctl restart sql-agent-dev.service
+
+  deploy-main:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy NodeJS App (Main)
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          key: ${{ secrets.SSH_KEY }}
+          username: ${{ secrets.SSH_USERNAME }}
+          script: |
+            cd /mnt/ai-agent-python
+            git checkout main && git pull origin main
+            # echo '${{secrets.MAIN_ENV}}' > .env
+            source /mnt/ai-agent-python/.venv/bin/activate
+            pip install -r requirements.txt
+            sudo systemctl restart sql-agent.service
