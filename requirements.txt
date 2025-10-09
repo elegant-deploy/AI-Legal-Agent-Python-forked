@@ -18,6 +18,6 @@ requests
 # For text processing
 tiktoken
 
-# Other
+# Other utilities
 python-dotenv
 tqdm
