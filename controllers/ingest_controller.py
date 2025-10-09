@@ -8,9 +8,6 @@ import chromadb
 from chromadb.utils import embedding_functions
 from config.settings import settings
 
-# Cache for embedder
-_embedder_cache = {}
-
 # Domain detection from filenames
 DOMAIN_KEYWORDS = {
     'traffic': ['traffic', 'motor', 'vehicle', 'driving', 'license', 'transport', 'road'],
@@ -157,7 +154,7 @@ def ingest_pdf(pdf_path: str, force: bool = False):
     print(f"📄 Extracted {len(documents)} pages with text")
 
     # Create chunks with improved chunking
-    chunks = smart_chunking(documents, chunk_size=500, chunk_overlap=60)
+    chunks = smart_chunking(documents, chunk_size=600, chunk_overlap=80)
     print(f"🔪 Created {len(chunks)} chunks")
 
     # Prepare data for Chroma
@@ -172,11 +169,8 @@ def ingest_pdf(pdf_path: str, force: bool = False):
 
     # Compute embeddings
     print("🧮 Computing embeddings...")
-    model_name = "all-MiniLM-L6-v2"
-    if model_name not in _embedder_cache:
-        _embedder_cache[model_name] = SentenceTransformer(model_name)
-    embedder = _embedder_cache[model_name]
-    embeddings = embedder.encode(documents_list, show_progress_bar=False, convert_to_numpy=True)
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = embedder.encode(documents_list, show_progress_bar=True, convert_to_numpy=True)
 
     # Create collection and upload
     print(f"🚀 Creating collection '{collection_name}'...")

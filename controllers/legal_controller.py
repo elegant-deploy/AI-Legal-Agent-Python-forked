@@ -1,18 +1,11 @@
 from agent.legal_agent import SmartLegalAssistant
 
-# Lazy initialization
-assistant = None
-
-def get_assistant():
-    global assistant
-    if assistant is None:
-        assistant = SmartLegalAssistant()
-    return assistant
+# Initialize the assistant
+assistant = SmartLegalAssistant()
 
 def ask_legal_question(question: str):
     """Process a legal question using the smart assistant"""
     try:
-        assistant = get_assistant()
         result = assistant(question)
         return {
             "success": True,

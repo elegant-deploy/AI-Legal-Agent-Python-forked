@@ -4,6 +4,7 @@ fastapi
 uvicorn
 pydantic
 langchain
+langchain-community
 langchain-core
 
 # For vector databases

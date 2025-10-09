@@ -18,10 +18,10 @@ def load_token_logs() -> list:
             return []
     return []
 
-def save_token_logs(logs: list):
-    """Save token usage logs to file"""
-    with open(TOKEN_LOG_FILE, 'w') as f:
-        json.dump(logs, f, indent=2)
+# def save_token_logs(logs: list):
+#     """Save token usage logs to file"""
+#     with open(TOKEN_LOG_FILE, 'w') as f:
+#         json.dump(logs, f, indent=2)
 
 async def track_token_usage_async(query_id: str, input_text: str, output_text: str, model: str = None):
     """Asynchronously track token usage for a query"""
@@ -46,8 +46,8 @@ async def track_token_usage_async(query_id: str, input_text: str, output_text: s
     logs.append(token_data)
 
     # Save asynchronously (in a real app, this would be in a database)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, save_token_logs, logs)
+    # loop = asyncio.get_event_loop()
+    # await loop.run_in_executor(None, save_token_logs, logs)
 
 def get_token_usage_by_query_id(query_id: str) -> Dict[str, Any]:
     """Get token usage for a specific query ID"""
