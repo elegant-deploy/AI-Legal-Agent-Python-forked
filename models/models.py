@@ -4,6 +4,7 @@ from typing import List, Any, Optional
 # Legal Assistant Models
 class LegalQueryRequest(BaseModel):
     question: str
+    context: Optional[List[dict]] = None
 
 class LegalQueryResponse(BaseModel):
     success: bool

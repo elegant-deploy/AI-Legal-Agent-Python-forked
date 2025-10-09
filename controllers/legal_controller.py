@@ -3,15 +3,18 @@ from agent.legal_agent import SmartLegalAssistant
 # Initialize the assistant
 assistant = SmartLegalAssistant()
 
-def ask_legal_question(question: str):
+def ask_legal_question(question: str, context=None):
     """Process a legal question using the smart assistant"""
     try:
-        result = assistant(question)
+        result = assistant(question, context)
         return {
             "success": True,
             "data": result
         }
     except Exception as e:
+        import traceback
+        print(f"Error in ask_legal_question: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         return {
             "success": False,
             "error": str(e)

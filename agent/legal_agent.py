@@ -17,8 +17,8 @@ OPENROUTER_API_KEY = settings.OPENROUTER_API_KEY
 # Domain detection keywords
 DOMAIN_KEYWORDS = {
     'traffic': ['traffic', 'motor vehicle', 'driving', 'license', 'transport', 'road', 'accident', 'speeding', 'vehicle registration'],
-    'family': ['family', 'marriage', 'divorce', 'inheritance', 'guardian', 'child', 'maintenance', 'custody', 'dowry', 'marital', "alimony", "child support", "adoption", "domestic violence", "family dispute", "nikah", "mehr", "talaq", "khula", "wasiat","pakistan family law","family court","family act","family ordinance"],
-    'corporate': ['corporate', 'company', 'business', 'commercial', 'contract', 'partnership', 'incorporation', 'shareholder', 'director', 'board'],
+    'family': ['family', 'marriage','witness','nikah witness', 'divorce', 'inheritance', 'guardian', 'child', 'maintenance', 'custody', 'dowry', 'marital', "alimony", "child support", "adoption", "domestic violence", "family dispute", "nikah", "mehr", "talaq", "khula", "wasiat","pakistan family law","family court","family act","family ordinance"],
+    'corporate': ['corporate', 'company', 'business', 'commercial', 'contract', 'partnership', 'incorporation', 'shareholder', 'director', 'board','leaves', 'employee', 'employment', 'labor', 'workplace', 'hr', 'human resources', 'termination', 'hiring', 'firing', 'work hours', 'overtime', 'payroll', 'benefits', 'discrimination', 'harassment', 'workplace safety','pakistan labor law','pakistan employment law','labor court','employment act','industrial relations','maternity', 'paternity', 'casual', 'sick leave', 'annual leave', 'leave policy'],
     'ppc': ['ppc', 'penal', 'criminal', 'crime', 'offense', 'punishment', 'ipc', 'pakistan penal', 'theft', 'jail','imprisonment']
 }
 
@@ -176,6 +176,10 @@ You are a professional Pakistan AI Legal Assistant. Use ONLY the CONTEXT provide
 5. If information is incomplete, state what information is available
 6. Use formal legal language appropriate for Pakistan's legal system
 7. Mention which legal domain this information comes from
+8. Consider the conversation history for context, but prioritize the legal context provided
+
+**CONVERSATION HISTORY:**
+{history}
 
 **CONTEXT FROM {domain} LAW:**
 {context}
@@ -185,7 +189,7 @@ You are a professional Pakistan AI Legal Assistant. Use ONLY the CONTEXT provide
 
 **ANSWER:**
 """,
-            input_variables=["context", "question", "domain"]
+            input_variables=["history", "context", "question", "domain"]
         )
 
     def search_collections(self, query: str, collection_names: List[str], k_per_collection: int = 3):
@@ -201,13 +205,13 @@ You are a professional Pakistan AI Legal Assistant. Use ONLY the CONTEXT provide
 
         return all_docs
 
-    def __call__(self, query: str):
+    def __call__(self, question: str, conversation_history: Optional[List[dict]] = None):
         # Generate unique query ID
         query_id = str(uuid.uuid4())
 
         # Step 1: Detect domain and relevant collections
         print("🧠 Analyzing query domain...")
-        domain, collections_to_search = detect_query_domain(query)
+        domain, collections_to_search = detect_query_domain(question)
 
         print(f"🎯 Detected Domain: {domain.upper()}")
         print(f"📚 Collections to search: {len(collections_to_search)}")
@@ -222,24 +226,24 @@ You are a professional Pakistan AI Legal Assistant. Use ONLY the CONTEXT provide
 
         # Step 2: Search relevant collections
         print("🔍 Searching legal databases...")
-        source_docs = self.search_collections(query, collections_to_search, k_per_collection=3)
+        source_docs = self.search_collections(question, collections_to_search, k_per_collection=3)
 
         if not source_docs:
             # Fallback: Search all collections with broader search
             print("⚠️  No results in targeted search. Expanding search to all collections...")
             all_collections = get_all_collections()
-            source_docs = self.search_collections(query, all_collections, k_per_collection=2)
+            source_docs = self.search_collections(question, all_collections, k_per_collection=2)
 
             if not source_docs:
                 return {
-                    "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{query}'\n\n💡 **Suggestions:**\n• Be more specific about your legal query\n• Check if the relevant legal documents have been uploaded\n• Specify which domain of law you're interested in (Traffic, Family, Corporate)",
+                    "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'\n\n💡 **Suggestions:**\n• Be more specific about your legal query\n• Check if the relevant legal documents have been uploaded\n• Specify which domain of law you're interested in (Traffic, Family, Corporate)",
                     "source_documents": [],
                     "searched_collections": all_collections,
                     "query_id": query_id
                 }
 
-        # Step 3: Combine context and generate answer
-        context_parts = []
+        # Step 3: Combine legal context and generate answer
+        legal_context_parts = []
         domains_used = set()
 
         for doc in source_docs:
@@ -248,15 +252,22 @@ You are a professional Pakistan AI Legal Assistant. Use ONLY the CONTEXT provide
             doc_domain = doc.metadata.get('domain', 'general')
             domains_used.add(doc_domain)
 
-            context_parts.append(f"{doc.page_content}\n[Source: {source_info} | Collection: {collection}]")
+            legal_context_parts.append(f"{doc.page_content}\n[Source: {source_info} | Collection: {collection}]")
 
-        context = "\n\n".join(context_parts)
+        legal_context = "\n\n".join(legal_context_parts)
         primary_domain = domain if domain != "general" else list(domains_used)[0] if domains_used else "general"
+
+        # Format conversation history
+        if conversation_history:
+            history_str = "\n".join([f"{msg['sender'].capitalize()}: {msg['text']}" for msg in conversation_history])
+        else:
+            history_str = ""
 
         # Generate answer
         formatted_prompt = self.prompt.format(
-            context=context,
-            question=query,
+            history=history_str,
+            context=legal_context,
+            question=question,
             domain=primary_domain.upper()
         )
 
