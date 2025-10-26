@@ -12,7 +12,7 @@ async def ask_legal(payload: LegalQueryRequest):
     if not payload.question or not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    result = ask_legal_question(payload.question.strip(), payload.context)
+    result = await ask_legal_question(payload.question.strip(), payload.context)
     return LegalQueryResponse(**result)
 
 

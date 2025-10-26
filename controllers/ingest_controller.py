@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
 from chromadb.utils import embedding_functions
 from config.settings import settings
@@ -85,24 +85,40 @@ def extract_text_with_metadata(pdf_path: str):
 
     return documents, domain
 
-def smart_chunking(documents, chunk_size=800, chunk_overlap=100):
-    """Improved chunking that preserves legal document structure"""
+def smart_chunking(documents, chunk_size=600, chunk_overlap=80):
+    """Optimized chunking that preserves legal document structure and improves retrieval"""
+    # Use legal-specific separators for better chunking
+    legal_separators = [
+        "\n\nSection", "\n\nArticle", "\n\nChapter", "\n\nPart",
+        "\n\n(", "\n\n1.", "\n\n2.", "\n\n3.", "\n\n4.", "\n\n5.",
+        "\n\n(a)", "\n\n(b)", "\n\n(c)", "\n\n(d)", "\n\n(e)",
+        "\n\n(i)", "\n\n(ii)", "\n\n(iii)",
+        "\n\n", "\n", ". ", "! ", "? ", "; ", " ", ""
+    ]
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         length_function=len,
-        separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+        separators=legal_separators,
+        keep_separator=True  # Keep separators to maintain legal structure
     )
 
     all_chunks = []
     for doc in documents:
         chunks = splitter.split_text(doc['page_content'])
         for j, chunk in enumerate(chunks):
+            # Skip very small chunks that might not be meaningful
+            if len(chunk.strip()) < 50:
+                continue
+
             chunk_metadata = doc['metadata'].copy()
             chunk_metadata.update({
                 'chunk_id': j,
                 'total_chunks_doc': len(chunks),
-                'chunk_size': len(chunk)
+                'chunk_size': len(chunk),
+                'chunk_start_pos': j * (chunk_size - chunk_overlap),  # Approximate position
+                'has_section_header': any(header in chunk[:100] for header in ['Section', 'Article', 'Chapter'])
             })
             all_chunks.append({
                 'content': chunk,
@@ -153,9 +169,9 @@ def ingest_pdf(pdf_path: str, force: bool = False):
     print(f"📖 Extracting and processing text from '{pdf_path}'...")
     print(f"📄 Extracted {len(documents)} pages with text")
 
-    # Create chunks with improved chunking
-    chunks = smart_chunking(documents, chunk_size=600, chunk_overlap=80)
-    print(f"🔪 Created {len(chunks)} chunks")
+    # Create chunks with optimized chunking for legal documents
+    chunks = smart_chunking(documents, chunk_size=500, chunk_overlap=100)
+    print(f"🔪 Created {len(chunks)} optimized chunks (avg size: {sum(len(c['content']) for c in chunks)//len(chunks) if chunks else 0} chars)")
 
     # Prepare data for Chroma
     documents_list = []
