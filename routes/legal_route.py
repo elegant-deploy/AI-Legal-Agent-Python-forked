@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from models.models import LegalQueryRequest, LegalQueryResponse, IngestRequest, IngestResponse, SystemInfoResponse
 from controllers.legal_controller import ask_legal_question, get_system_info
+from controllers.decision_controller import process_decision_query, get_decision_flow_status
 from controllers.ingest_controller import ingest_pdf
 from helper.token_tracker import get_token_usage_by_query_id, get_all_token_usage, get_total_tokens_used
 
@@ -70,3 +71,20 @@ async def get_token_summary():
     """Get total token usage summary"""
     summary = get_total_tokens_used()
     return {"success": True, "data": summary}
+
+
+@router.post("/decide", response_model=LegalQueryResponse)
+async def make_decision(payload: LegalQueryRequest):
+    """Make legal decisions and provide actionable advice"""
+    if not payload.question or not payload.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    result = await process_decision_query(payload.question.strip(), payload.context)
+    return LegalQueryResponse(**result)
+
+
+@router.get("/decision-status")
+async def decision_status():
+    """Get status of the decision-making flow"""
+    result = get_decision_flow_status()
+    return result

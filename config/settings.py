@@ -18,8 +18,12 @@ class Settings:
         self.CHROMA_TENANT = os.getenv('CHROMA_TENANT')
         self.CHROMA_DATABASE = os.getenv('CHROMA_DATABASE')
 
-        # LLM MODEL
+        # LLM MODEL - Try different free models to avoid rate limits
         self.OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'deepseek/deepseek-r1-0528-qwen3-8b:free')
+
+        # Gemini API for lightweight tasks
+        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC3I937nk4tfVXZRkeBI48QZY-qheWUj2g')
+        self.DEVELOPMENT_MODEL = os.getenv('DEVELOPMENT_MODEL', 'gemini-2.0-flash')
 
         
         #AWS s3

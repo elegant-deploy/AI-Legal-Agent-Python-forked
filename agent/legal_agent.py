@@ -9,6 +9,7 @@ from chromadb.utils import embedding_functions
 from config.settings import settings
 from helper.token_tracker import track_token_usage_async
 from rank_bm25 import BM25Okapi
+from agent.gemini_llm import gemini_llm
 import numpy as np
 import asyncio
 import hashlib
@@ -31,7 +32,7 @@ DOMAIN_KEYWORDS = {
     
     'ppc': [
         # Core PPC terms
-        'ppc', 'penal', 'criminal', 'crime', 'offense', 'offence', 'punishment', 'ipc', 'pakistan penal', 'theft', 'jail', 'imprisonment',
+        'ppc', 'penal', 'criminal', 'crime', 'offense', 'offence', 'punishment', 'ipc', 'pakistan penal', 'theft', 'jail', 'imprisonment', 'forgery','bail', 'arrest', 'cognizable', 'non-cognizable', 'felony', 'misdemeanor',
         
         # Punishment types
         'death penalty', 'death sentence', 'life imprisonment', 'rigorous imprisonment', 'simple imprisonment', 'solitary confinement', 'fine', 'commutation',
@@ -73,12 +74,46 @@ class OpenRouterLLM(LLM):
     api_key: str = OPENROUTER_API_KEY
     model: str = OPENROUTER_MODEL
     api_url: str = OPENROUTER_API_URL
+    request_times: list = []  # Track request timestamps for rate limiting
+    max_requests_per_minute: int = 10  # Conservative limit for free tier
+    retry_delays: list = [1, 2, 4, 8, 16]  # Exponential backoff in seconds
 
     @property
     def _llm_type(self) -> str:
         return "openrouter"
 
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+    def _enforce_rate_limit(self):
+        """Enforce rate limiting to prevent 429 errors"""
+        current_time = time.time()
+
+        # Remove requests older than 1 minute
+        self.request_times = [t for t in self.request_times if current_time - t < 60]
+
+        # If we've hit the limit, wait
+        if len(self.request_times) >= self.max_requests_per_minute:
+            oldest_request = min(self.request_times)
+            wait_time = 60 - (current_time - oldest_request)
+            if wait_time > 0:
+                print(f"Rate limit reached. Waiting {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
+
+        # Record this request
+        self.request_times.append(current_time)
+
+    def _call_with_fallback(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        """Call Gemini first (3 attempts), then fallback to OpenRouter"""
+        from agent.gemini_llm import gemini_llm
+
+        # Try Gemini first (3 attempts)
+        print("🤖 Generating legal response...")
+        gemini_response = gemini_llm._call_with_retry(prompt, stop)
+        if not gemini_response.startswith("[Gemini Error]"):
+            print("✅ Gemini API call successful")
+            return gemini_response
+
+        print("⚠️ Gemini failed, falling back to OpenRouter...")
+
+        # Fallback to OpenRouter (1 attempt with rate limiting)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
@@ -89,13 +124,34 @@ class OpenRouterLLM(LLM):
             "temperature": 0.1,
             "max_tokens": 2000
         }
+
         try:
+            # Enforce rate limiting
+            self._enforce_rate_limit()
+
+            print("Calling OpenRouter API (fallback attempt)...")
             resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get('retry-after')
+                wait_time = int(retry_after) if retry_after else 5
+                print(f"Rate limited (429). Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                # One more try after waiting
+                resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
+
             resp.raise_for_status()
             data = resp.json()
+            print("✅ OpenRouter fallback successful")
             return data["choices"][0]["message"]["content"]
+
         except Exception as e:
-            return f"[OpenRouter Error] {e}"
+            print(f"❌ Both Gemini and OpenRouter failed: {e}")
+            return f"[API Error] Both primary and fallback LLM services failed. Please try again later. Error: {e}"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        """Main call method with Gemini-first, OpenRouter-fallback strategy"""
+        return self._call_with_fallback(prompt, stop)
 
 # ------------------ Chroma Setup ------------------
 def create_chroma_client():
@@ -318,10 +374,10 @@ Return only the reformulated queries, one per line.""",
         )
 
     def reformulate(self, question: str) -> List[str]:
-        """Reformulate the query into multiple search variants"""
+        """Reformulate the query into multiple search variants using Gemini"""
         try:
             prompt = self.prompt.format(question=question)
-            response = self.llm._call(prompt)
+            response = gemini_llm._call(prompt)
 
             # Parse the response to extract queries
             queries = []
@@ -370,10 +426,10 @@ Return only the classification information.""",
         )
 
     def classify(self, question: str) -> dict:
-        """Classify the query into legal domains"""
+        """Classify the query into legal domains using Gemini"""
         try:
             prompt = self.prompt.format(question=question, domains=', '.join(self.domains))
-            response = self.llm._call(prompt)
+            response = gemini_llm._call(prompt)
 
             # Parse response
             primary_domain = "general"
@@ -431,7 +487,7 @@ class RerankingAgent:
         )
 
     def rerank(self, question: str, documents: List) -> List:
-        """Rerank documents based on relevance"""
+        """Rerank documents based on relevance using Gemini"""
         if len(documents) <= 3:
             return documents  # No need to rerank small sets
 
@@ -447,7 +503,7 @@ class RerankingAgent:
                 documents='\n'.join(doc_summaries)
             )
 
-            response = self.llm._call(prompt)
+            response = gemini_llm._call(prompt)
 
             # Parse rankings (simplified - in production, use more robust parsing)
             ranked_indices = []
@@ -536,6 +592,10 @@ class SmartLegalAssistant:
         self.reranking_agent = RerankingAgent(self.llm)
         self.query_cache = QueryCache()
 
+        # Import decision-making capabilities
+        self.decision_flow = None
+        self.decision_enabled = False
+
         self.prompt = PromptTemplate(
             template="""You are a professional Pakistan AI Legal Assistant. Use ONLY the CONTEXT provided to answer the QUESTION.
 
@@ -562,6 +622,57 @@ class SmartLegalAssistant:
 """,
             input_variables=["history", "context", "question", "domain"]
         )
+
+    def _create_enhanced_prompt(self, history_str: str, legal_context: str, question: str, domain: str, source_docs: List) -> str:
+        """Create an enhanced prompt with better context structuring and accuracy instructions"""
+
+        # Extract key legal references from source documents
+        legal_references = []
+        for doc in source_docs[:3]:  # Top 3 most relevant
+            metadata = doc.metadata
+            collection = metadata.get('collection_name', 'Unknown')
+            page = metadata.get('page_number', 'N/A')
+            legal_references.append(f"- {collection} (Page {page})")
+
+        enhanced_context = f"""
+**LEGAL CONTEXT SUMMARY:**
+{legal_context}
+
+**SOURCE DOCUMENTS CITED:**
+{chr(10).join(legal_references)}
+
+**DOMAIN:** {domain.upper()} LAW - PAKISTAN
+"""
+
+        enhanced_prompt = f"""You are an elite Pakistani Legal AI Assistant with deep expertise in Pakistani law. Your responses must be exceptionally accurate, professional, and authoritative.
+
+**CRITICAL REQUIREMENTS:**
+1. **LEGAL ACCURACY FIRST**: Base your answer ONLY on the provided legal context
+2. **CITATION MANDATORY**: Always cite specific sections, acts, or provisions from the context
+3. **STRUCTURED FORMAT**: Use clear headings, numbered lists, and professional formatting
+4. **PAKISTANI LAW FOCUS**: Reference Pakistani legal system, courts, and procedures
+5. **CONSERVATIVE ADVICE**: When in doubt, recommend consulting qualified legal professionals
+6. **EVIDENCE-BASED**: Support all claims with references to the provided legal sources
+
+**CONVERSATION CONTEXT:**
+{history_str}
+
+**LEGAL SOURCES AVAILABLE:**
+{enhanced_context}
+
+**USER QUESTION:**
+{question}
+
+**YOUR RESPONSE MUST:**
+- Start with the most relevant legal provision or section
+- Provide step-by-step analysis if applicable
+- Include specific article/section references
+- End with appropriate disclaimers about seeking professional legal advice
+
+**PROFESSIONAL LEGAL RESPONSE:**
+"""
+
+        return enhanced_prompt
 
     async def search_collections_async(self, queries: List[str], collection_names: List[str], k_per_collection: int = 3):
         """Asynchronously search across multiple collections with multiple query formulations"""
@@ -649,10 +760,44 @@ class SmartLegalAssistant:
         # Generate unique query ID
         query_id = str(uuid.uuid4())
 
-        print("🚀 Starting multi-agent legal analysis...")
+        print("Starting multi-agent legal analysis...")
 
-        # Step 1: Query Classification
-        print("🧠 Classifying query domain...")
+        # Check if decision-making is enabled and use LangGraph flow
+        if self.decision_enabled and self.decision_flow:
+            print("Using Decision-Making Flow...")
+            try:
+                decision_result = await self.decision_flow.process_query(question)
+
+                if decision_result['success']:
+                    # Return formatted response
+                    result = {
+                        "result": decision_result['response'],
+                        "source_documents": [],  # Will be populated by the flow if needed
+                        "searched_collections": [],
+                        "detected_domain": "decision_making",
+                        "reformulated_queries": [],
+                        "query_id": query_id,
+                        "intent_analysis": decision_result.get('intent', {}),
+                        "processing_path": decision_result.get('processing_path', 'unknown')
+                    }
+
+                    # Track token usage asynchronously
+                    asyncio.create_task(track_token_usage_async(query_id, question, decision_result['response']))
+
+                    print("Decision-making response generated successfully!")
+                    return result
+                else:
+                    print(f"Decision flow failed: {decision_result.get('error', 'Unknown error')}")
+                    # Fall back to traditional RAG
+            except Exception as e:
+                print(f"Decision flow error: {e}")
+                # Fall back to traditional RAG
+
+        # Traditional RAG flow (fallback or when decision-making disabled)
+        print("Using Traditional RAG Flow...")
+
+        # Step 1: Query Classification using Gemini
+        print("Classifying query domain using Gemini...")
         classification = self.classification_agent.classify(question)
         domain = classification['primary_domain']
         all_domains = classification['all_domains']
@@ -684,8 +829,8 @@ class SmartLegalAssistant:
             cached_result['query_id'] = query_id  # Update query ID
             return cached_result
 
-        # Step 2: Query Reformulation
-        print("🔄 Reformulating query for better search...")
+        # Step 2: Query Reformulation using Gemini
+        print("Reformulating query using Gemini...")
         reformulated_queries = self.reformulation_agent.reformulate(question)
         print(f"📝 Generated {len(reformulated_queries)} query variants")
 
@@ -710,8 +855,8 @@ class SmartLegalAssistant:
                 self.query_cache.set(question, collections_to_search, no_result)
                 return no_result
 
-        # Step 4: Reranking
-        print("📊 Reranking results for relevance...")
+        # Step 4: Reranking using Gemini
+        print("Reranking results using Gemini...")
         reranked_docs = self.reranking_agent.rerank(question, source_docs)
         # Take top 5 most relevant documents
         top_docs = reranked_docs[:5]
@@ -737,19 +882,16 @@ class SmartLegalAssistant:
         else:
             history_str = ""
 
-        # Generate answer
+        # Generate answer with enhanced prompt for better accuracy
         print("🤖 Generating legal response...")
-        formatted_prompt = self.prompt.format(
-            history=history_str,
-            context=legal_context,
-            question=question,
-            domain=primary_domain.upper()
+        enhanced_prompt = self._create_enhanced_prompt(
+            history_str, legal_context, question, primary_domain, top_docs
         )
 
-        answer = self.llm._call(formatted_prompt)
+        answer = self.llm._call(enhanced_prompt)
 
         # Track token usage asynchronously
-        asyncio.create_task(track_token_usage_async(query_id, formatted_prompt, answer))
+        asyncio.create_task(track_token_usage_async(query_id, enhanced_prompt, answer))
 
         result = {
             "result": answer,
