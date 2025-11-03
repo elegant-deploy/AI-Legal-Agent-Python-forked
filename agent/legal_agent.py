@@ -24,9 +24,48 @@ OPENROUTER_API_KEY = settings.OPENROUTER_API_KEY
 # Domain detection keywords
 DOMAIN_KEYWORDS = {
     'traffic': ['traffic', 'updated fines', 'fines', 'fine', 'motor vehicle', 'driving', 'license', 'transport', 'road', 'accident', 'speeding', 'vehicle registration'],
-    'family': ['family', 'marriage','witness','nikah witness','nikah', 'divorce', 'inheritance', 'guardian', 'child', 'maintenance', 'custody', 'dowry', 'marital', "alimony", "child support", "adoption", "domestic violence", "family dispute", "nikaah", "mehr", "talaq", "khula", "wasiat","pakistan family law","family court","family act","family ordinance"],
+    
+    'family': ['family', 'marriage','witness','nikah witness','nikah', 'divorce', 'inheritance', 'guardian', 'child', 'maintenance', 'custody', 'dowry','dower','marital', "alimony", "child support", "adoption", "domestic violence", "family dispute", "nikaah", "mehr", "talaq", "khula", "wasiat","pakistan family law","family court","family act","family ordinance"],
+    
     'corporate': ['corporate', 'company', 'business', 'commercial', 'contract', 'partnership', 'incorporation', 'shareholder', 'director', 'board','leaves', 'employee', 'employment', 'labor', 'workplace', 'hr', 'human resources', 'termination', 'hiring', 'firing', 'work hours', 'overtime', 'payroll', 'benefits', 'discrimination', 'harassment', 'workplace safety','pakistan labor law','pakistan employment law','labor court','employment act','industrial relations','maternity', 'paternity', 'casual', 'sick leave', 'annual leave', 'leave policy'],
-    'ppc': ['ppc', 'penal', 'criminal', 'crime', 'offense', 'punishment', 'ipc', 'pakistan penal', 'theft', 'jail','imprisonment']
+    
+    'ppc': [
+        # Core PPC terms
+        'ppc', 'penal', 'criminal', 'crime', 'offense', 'offence', 'punishment', 'ipc', 'pakistan penal', 'theft', 'jail', 'imprisonment',
+        
+        # Punishment types
+        'death penalty', 'death sentence', 'life imprisonment', 'rigorous imprisonment', 'simple imprisonment', 'solitary confinement', 'fine', 'commutation',
+        
+        # General exceptions/defenses
+        'private defence', 'self defence', 'general exceptions', 'mistake of fact', 'accident', 'consent', 'unsound mind', 'intoxication', 'child offense', 'minor offense',
+        
+        # Offense categories
+        'abetment', 'conspiracy', 'criminal conspiracy', 'attempt', 'attempt to commit',
+        
+        # Specific offenses from chapters
+        'waging war', 'sedition', 'mutiny', 'army offense', 'navy offense', 'air force offense',
+        'unlawful assembly', 'rioting', 'affray', 'public tranquility',
+        'bribery', 'corruption', 'public servant', 'gratification', 'official act',
+        'false evidence', 'perjury', 'fabricating evidence', 'public justice',
+        'coin offense', 'counterfeiting', 'government stamp', 'currency note', 'banknote',
+        'weights measures', 'false weight', 'false measure',
+        'public health', 'public safety', 'nuisance', 'adulteration', 'quarantine',
+        'religion offense', 'religious feelings', 'place of worship', 'holy quran', 'prophet',
+        'qatl', 'murder', 'homicide', 'hurt', 'grievous hurt', 'diyat', 'qisas', 'arsh',
+        'wrongful restraint', 'wrongful confinement', 'criminal force', 'assault',
+        'kidnapping', 'abduction', 'slavery', 'forced labour', 'human trafficking',
+        'rape', 'sexual offense', 'unnatural offense', 'sexual abuse',
+        'theft', 'extortion', 'robbery', 'dacoity', 'hijacking',
+        'criminal misappropriation', 'criminal breach trust', 'cheating', 'fraud',
+        'mischief', 'criminal trespass', 'house trespass', 'housebreaking',
+        'oil gas offense', 'electricity offense', 'tampering', 'theft of energy',
+        'forgery', 'false document', 'trade mark', 'property mark',
+        'defamation', 'criminal intimidation', 'insult', 'annoyance',
+        
+        # Legal procedures and concepts
+        'sentence', 'punishment', 'conviction', 'previous conviction', 'enhanced punishment',
+        'right of private defence', 'extent of private defence', 'commencement of defence'
+    ]
 }
 
 # ------------------ Custom OpenRouter LLM wrapper ------------------

@@ -7,6 +7,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
 from chromadb.utils import embedding_functions
 from config.settings import settings
+import numpy as np
 
 # Domain detection from filenames
 DOMAIN_KEYWORDS = {
@@ -85,47 +86,121 @@ def extract_text_with_metadata(pdf_path: str):
 
     return documents, domain
 
-def smart_chunking(documents, chunk_size=600, chunk_overlap=80):
-    """Optimized chunking that preserves legal document structure and improves retrieval"""
-    # Use legal-specific separators for better chunking
+def smart_chunking(documents, chunk_size=500, chunk_overlap=150):
+    """Advanced sliding window chunking that preserves legal document structure and improves retrieval"""
+    # Enhanced legal-specific separators for better chunking
     legal_separators = [
-        "\n\nSection", "\n\nArticle", "\n\nChapter", "\n\nPart",
-        "\n\n(", "\n\n1.", "\n\n2.", "\n\n3.", "\n\n4.", "\n\n5.",
-        "\n\n(a)", "\n\n(b)", "\n\n(c)", "\n\n(d)", "\n\n(e)",
-        "\n\n(i)", "\n\n(ii)", "\n\n(iii)",
+        "\n\nSection", "\n\nArticle", "\n\nChapter", "\n\nPart", "\n\nClause",
+        "\n\n(", "\n\n1.", "\n\n2.", "\n\n3.", "\n\n4.", "\n\n5.", "\n\n6.", "\n\n7.", "\n\n8.", "\n\n9.", "\n\n10.",
+        "\n\n(a)", "\n\n(b)", "\n\n(c)", "\n\n(d)", "\n\n(e)", "\n\n(f)", "\n\n(g)", "\n\n(h)", "\n\n(i)", "\n\n(j)",
+        "\n\n(i)", "\n\n(ii)", "\n\n(iii)", "\n\n(iv)", "\n\n(v)", "\n\n(vi)", "\n\n(vii)",
         "\n\n", "\n", ". ", "! ", "? ", "; ", " ", ""
     ]
 
+    # First pass: Create initial chunks with legal structure awareness
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         length_function=len,
         separators=legal_separators,
-        keep_separator=True  # Keep separators to maintain legal structure
+        keep_separator=True
     )
 
-    all_chunks = []
+    initial_chunks = []
     for doc in documents:
         chunks = splitter.split_text(doc['page_content'])
         for j, chunk in enumerate(chunks):
-            # Skip very small chunks that might not be meaningful
-            if len(chunk.strip()) < 50:
-                continue
+            if len(chunk.strip()) >= 50:  # Minimum meaningful chunk size
+                chunk_metadata = doc['metadata'].copy()
+                chunk_metadata.update({
+                    'chunk_id': j,
+                    'total_chunks_doc': len(chunks),
+                    'chunk_size': len(chunk),
+                    'chunk_start_pos': j * (chunk_size - chunk_overlap),
+                    'has_section_header': any(header in chunk[:150] for header in ['Section', 'Article', 'Chapter', 'Part', 'Clause']),
+                    'chunk_type': 'primary'
+                })
+                initial_chunks.append({
+                    'content': chunk,
+                    'metadata': chunk_metadata
+                })
 
-            chunk_metadata = doc['metadata'].copy()
-            chunk_metadata.update({
-                'chunk_id': j,
-                'total_chunks_doc': len(chunks),
-                'chunk_size': len(chunk),
-                'chunk_start_pos': j * (chunk_size - chunk_overlap),  # Approximate position
-                'has_section_header': any(header in chunk[:100] for header in ['Section', 'Article', 'Chapter'])
-            })
-            all_chunks.append({
-                'content': chunk,
-                'metadata': chunk_metadata
-            })
+    # Second pass: Sliding window enhancement for better context overlap
+    enhanced_chunks = []
+    window_size = 3  # Number of chunks to consider in sliding window
 
-    return all_chunks
+    for i, chunk in enumerate(initial_chunks):
+        enhanced_chunks.append(chunk)
+
+        # Create sliding window overlaps for better retrieval
+        if i > 0 and i < len(initial_chunks) - 1:
+            # Create overlapping chunks with neighboring content
+            prev_chunk = initial_chunks[i-1]['content'][-200:] if i > 0 else ""
+            next_chunk = initial_chunks[i+1]['content'][:200] if i < len(initial_chunks)-1 else ""
+
+            # Enhanced chunk with context from neighbors
+            enhanced_content = prev_chunk + " " + chunk['content'] + " " + next_chunk
+            enhanced_content = enhanced_content.strip()
+
+            if len(enhanced_content) > chunk_size * 0.8:  # Only if meaningful enhancement
+                enhanced_metadata = chunk['metadata'].copy()
+                enhanced_metadata.update({
+                    'chunk_type': 'sliding_window',
+                    'window_size': window_size,
+                    'has_context_overlap': True,
+                    'chunk_size': len(enhanced_content)
+                })
+
+                enhanced_chunks.append({
+                    'content': enhanced_content,
+                    'metadata': enhanced_metadata
+                })
+
+    # Third pass: Semantic chunking for very long sections
+    final_chunks = []
+    for chunk in enhanced_chunks:
+        content = chunk['content']
+        if len(content) > chunk_size * 2:  # If chunk is too long, split semantically
+            semantic_chunks = _semantic_split_long_chunk(content, chunk_size, chunk_overlap)
+            for semantic_chunk in semantic_chunks:
+                semantic_metadata = chunk['metadata'].copy()
+                semantic_metadata.update({
+                    'chunk_type': 'semantic_split',
+                    'original_chunk_size': len(content),
+                    'chunk_size': len(semantic_chunk)
+                })
+                final_chunks.append({
+                    'content': semantic_chunk,
+                    'metadata': semantic_metadata
+                })
+        else:
+            final_chunks.append(chunk)
+
+    return final_chunks
+
+def _semantic_split_long_chunk(text, chunk_size, overlap):
+    """Split long chunks based on semantic boundaries"""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        if len(current_chunk + sentence) <= chunk_size:
+            current_chunk += sentence + " "
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+                # Add overlap from previous chunk
+                overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                current_chunk = overlap_text + " " + sentence + " "
+            else:
+                chunks.append(sentence)
+                current_chunk = sentence + " "
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
 
 def get_collection_name(domain, pdf_name):
     """Generate collection name based on domain"""
@@ -169,9 +244,12 @@ def ingest_pdf(pdf_path: str, force: bool = False):
     print(f"📖 Extracting and processing text from '{pdf_path}'...")
     print(f"📄 Extracted {len(documents)} pages with text")
 
-    # Create chunks with optimized chunking for legal documents
-    chunks = smart_chunking(documents, chunk_size=500, chunk_overlap=100)
-    print(f"🔪 Created {len(chunks)} optimized chunks (avg size: {sum(len(c['content']) for c in chunks)//len(chunks) if chunks else 0} chars)")
+    # Create chunks with advanced sliding window chunking for legal documents
+    chunks = smart_chunking(documents, chunk_size=450, chunk_overlap=150)
+    print(f"🔪 Created {len(chunks)} advanced chunks (avg size: {sum(len(c['content']) for c in chunks)//len(chunks) if chunks else 0} chars)")
+    print(f"   📊 Chunk types: Primary={sum(1 for c in chunks if c['metadata'].get('chunk_type')=='primary')}, "
+          f"Sliding={sum(1 for c in chunks if c['metadata'].get('chunk_type')=='sliding_window')}, "
+          f"Semantic={sum(1 for c in chunks if c['metadata'].get('chunk_type')=='semantic_split')}")
 
     # Prepare data for Chroma
     documents_list = []
@@ -183,14 +261,25 @@ def ingest_pdf(pdf_path: str, force: bool = False):
         metadatas_list.append(chunk_data['metadata'])
         ids_list.append(f"chunk_{i:04d}")
 
-    # Compute embeddings
-    print("🧮 Computing embeddings...")
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    try:
+        # Try to use Qwen model if available, fallback to MiniLM
+        embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        print("   Using all-MiniLM-L6-v2 for embeddings")
+    except Exception as e:
+        print(f"   Warning: Could not load preferred embedder: {e}")
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
     embeddings = embedder.encode(documents_list, show_progress_bar=True, convert_to_numpy=True)
 
-    # Create collection and upload
+    # Create collection and upload with optimized embedding function
     print(f"🚀 Creating collection '{collection_name}'...")
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    try:
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        print("   Using all-MiniLM-L6-v2 embedding function")
+    except Exception as e:
+        print(f"   Warning: Could not load preferred embedding function: {e}")
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
     collection = client.create_collection(name=collection_name, embedding_function=ef)
 
     # Upload in batches
