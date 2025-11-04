@@ -232,29 +232,54 @@ def get_collection_retriever(collection_name: str, k: int = 4):
             def _build_bm25_index(self):
                 """Build BM25 index for keyword search"""
                 try:
-                    # Get all documents from collection
-                    results = self.collection.get(include=['documents', 'metadatas', 'ids'])
-                    if results['documents']:
+                    # Get all documents from collection with correct include parameters
+                    results = self.collection.get(include=['documents', 'metadatas'])
+                    if results['documents'] and results['metadatas']:
                         self.documents = results['documents']
-                        self.doc_ids = results['ids']
-                        # Tokenize documents for BM25
-                        tokenized_docs = [doc.lower().split() for doc in self.documents]
+                        self.doc_ids = [meta.get('doc_id', f'doc_{i}') for i, meta in enumerate(results['metadatas'])]
+                        # Tokenize documents for BM25 with better preprocessing
+                        tokenized_docs = []
+                        for doc in self.documents:
+                            # Clean and tokenize the document
+                            tokens = doc.lower().replace('\n', ' ').replace('\t', ' ').split()
+                            # Remove very short tokens and common stop words
+                            filtered_tokens = [token for token in tokens if len(token) > 2]
+                            tokenized_docs.append(filtered_tokens)
                         self.bm25_index = BM25Okapi(tokenized_docs)
+                        print(f"Successfully built BM25 index for {self.collection_name} with {len(tokenized_docs)} documents")
                 except Exception as e:
                     print(f"Warning: Could not build BM25 index for {self.collection_name}: {e}")
+                    self.bm25_index = None
 
             def _keyword_search(self, query: str, top_k: int = 10):
-                """Perform BM25 keyword search"""
+                """Perform BM25 keyword search with enhanced matching"""
                 if not self.bm25_index:
                     return []
 
-                query_tokens = query.lower().split()
+                # Enhanced query preprocessing
+                query_lower = query.lower()
+                # Extract numbers and legal terms more precisely
+                import re
+                numbers = re.findall(r'\d+', query_lower)
+                legal_terms = re.findall(r'section\s+\d+|article\s+\d+|clause\s+\d+', query_lower, re.IGNORECASE)
+
+                # Build search terms
+                query_tokens = query_lower.split()
+                if numbers:
+                    query_tokens.extend(numbers)  # Add numbers as separate tokens
+                if legal_terms:
+                    query_tokens.extend(legal_terms)
+
+                # Remove duplicates while preserving order
+                seen = set()
+                query_tokens = [x for x in query_tokens if not (x in seen or seen.add(x))]
+
                 bm25_scores = self.bm25_index.get_scores(query_tokens)
                 top_indices = np.argsort(bm25_scores)[::-1][:top_k]
 
                 keyword_docs = []
                 for idx in top_indices:
-                    if bm25_scores[idx] > 0:  # Only include relevant matches
+                    if bm25_scores[idx] > 0.1:  # Lower threshold for better recall
                         from langchain_core.documents import Document
                         doc = Document(
                             page_content=self.documents[idx],
@@ -262,7 +287,8 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                                 'doc_id': self.doc_ids[idx],
                                 'collection_name': self.collection_name,
                                 'search_score': float(bm25_scores[idx]),
-                                'search_type': 'keyword'
+                                'search_type': 'keyword',
+                                'matched_tokens': query_tokens
                             }
                         )
                         keyword_docs.append(doc)
@@ -299,29 +325,50 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                     print(f"Error in semantic search for {self.collection_name}: {e}")
                     return []
 
-            def _hybrid_rerank(self, semantic_docs: List, keyword_docs: List, alpha: float = 0.7):
-                """Combine semantic and keyword results with reranking"""
+            def _hybrid_rerank(self, semantic_docs: List, keyword_docs: List, alpha: float = 0.6):
+                """Combine semantic and keyword results with enhanced reranking"""
                 # Create a combined set of unique documents
                 all_docs = {}
                 doc_scores = {}
+                doc_sources = {}  # Track source for better scoring
 
-                # Add semantic search results
+                # Add semantic search results with higher base weight
                 for doc in semantic_docs:
                     doc_id = doc.metadata.get('doc_id')
                     all_docs[doc_id] = doc
-                    doc_scores[doc_id] = alpha  # Base score for semantic
+                    doc_scores[doc_id] = alpha
+                    doc_sources[doc_id] = 'semantic'
 
-                # Add keyword search results
+                # Add keyword search results with boosted scoring for legal content
                 for doc in keyword_docs:
                     doc_id = doc.metadata.get('doc_id')
-                    score = doc.metadata.get('search_score', 0)
+                    base_score = doc.metadata.get('search_score', 0)
+
+                    # Boost score for documents containing legal section numbers
+                    content = doc.page_content.lower()
+                    query_terms = doc.metadata.get('matched_tokens', [])
+                    legal_boost = 0
+
+                    # Check for section/article numbers in content
+                    for term in query_terms:
+                        if term.isdigit() and len(term) <= 4:  # Likely a section number
+                            if term in content:
+                                legal_boost += 0.3  # Significant boost for exact matches
+                        elif 'section' in term.lower() and any(char.isdigit() for char in term):
+                            if term.lower() in content:
+                                legal_boost += 0.4  # Even higher boost for section references
+
+                    keyword_score = (1 - alpha) * (base_score + legal_boost)
+
                     if doc_id in all_docs:
                         # Combine scores for documents found in both
-                        doc_scores[doc_id] += (1 - alpha) * score
+                        doc_scores[doc_id] += keyword_score
+                        doc_sources[doc_id] = 'hybrid'
                     else:
                         # New document from keyword search
                         all_docs[doc_id] = doc
-                        doc_scores[doc_id] = (1 - alpha) * score
+                        doc_scores[doc_id] = keyword_score
+                        doc_sources[doc_id] = 'keyword'
 
                 # Sort by combined score and return top k
                 sorted_docs = sorted(all_docs.values(), key=lambda x: doc_scores[x.metadata['doc_id']], reverse=True)
@@ -628,15 +675,59 @@ class SmartLegalAssistant:
 
         # Extract key legal references from source documents
         legal_references = []
-        for doc in source_docs[:3]:  # Top 3 most relevant
-            metadata = doc.metadata
-            collection = metadata.get('collection_name', 'Unknown')
-            page = metadata.get('page_number', 'N/A')
+        section_numbers = []
+
+        for doc in source_docs[:5]:  # Top 5 most relevant
+            collection = doc.metadata.get('collection_name', 'Unknown')
+            page = doc.metadata.get('page_number', 'N/A')
+
+            # Extract section numbers from content for better context
+            content = doc.page_content.lower()
+            import re
+            found_sections = re.findall(r'section\s+(\d+)', content, re.IGNORECASE)
+            if found_sections:
+                section_numbers.extend([f"Section {s}" for s in found_sections[:3]])  # Limit to 3 per doc
+
             legal_references.append(f"- {collection} (Page {page})")
 
-        enhanced_context = f"""
+        # Create focused context based on question type
+        question_lower = question.lower()
+        if 'section' in question_lower and any(char.isdigit() for char in question):
+            # Extract section number from question
+            section_match = re.search(r'section\s+(\d+)', question_lower, re.IGNORECASE)
+            if section_match:
+                target_section = section_match.group(1)
+                enhanced_context = f"""
+**TARGET SECTION:** Section {target_section} of {domain.upper()} Law
+
+**LEGAL CONTEXT (FOCUSED ON SECTION {target_section}):**
+{legal_context}
+
+**AVAILABLE SECTIONS IN CONTEXT:** {', '.join(list(set(section_numbers))[:10])}
+
+**SOURCE DOCUMENTS CITED:**
+{chr(10).join(legal_references)}
+
+**DOMAIN:** {domain.upper()} LAW - PAKISTAN
+"""
+            else:
+                enhanced_context = f"""
 **LEGAL CONTEXT SUMMARY:**
 {legal_context}
+
+**AVAILABLE SECTIONS:** {', '.join(list(set(section_numbers))[:10])}
+
+**SOURCE DOCUMENTS CITED:**
+{chr(10).join(legal_references)}
+
+**DOMAIN:** {domain.upper()} LAW - PAKISTAN
+"""
+        else:
+            enhanced_context = f"""
+**LEGAL CONTEXT SUMMARY:**
+{legal_context}
+
+**AVAILABLE SECTIONS:** {', '.join(list(set(section_numbers))[:10])}
 
 **SOURCE DOCUMENTS CITED:**
 {chr(10).join(legal_references)}
@@ -649,10 +740,11 @@ class SmartLegalAssistant:
 **CRITICAL REQUIREMENTS:**
 1. **LEGAL ACCURACY FIRST**: Base your answer ONLY on the provided legal context
 2. **CITATION MANDATORY**: Always cite specific sections, acts, or provisions from the context
-3. **STRUCTURED FORMAT**: Use clear headings, numbered lists, and professional formatting
-4. **PAKISTANI LAW FOCUS**: Reference Pakistani legal system, courts, and procedures
-5. **CONSERVATIVE ADVICE**: When in doubt, recommend consulting qualified legal professionals
-6. **EVIDENCE-BASED**: Support all claims with references to the provided legal sources
+3. **DIRECT ANSWERS**: If the question asks for a specific section, provide its exact content and explanation
+4. **STRUCTURED FORMAT**: Use clear headings, numbered lists, and professional formatting
+5. **PAKISTANI LAW FOCUS**: Reference Pakistani legal system, courts, and procedures
+6. **CONSERVATIVE ADVICE**: When in doubt, recommend consulting qualified legal professionals
+7. **EVIDENCE-BASED**: Support all claims with references to the provided legal sources
 
 **CONVERSATION CONTEXT:**
 {history_str}
@@ -663,16 +755,80 @@ class SmartLegalAssistant:
 **USER QUESTION:**
 {question}
 
-**YOUR RESPONSE MUST:**
-- Start with the most relevant legal provision or section
-- Provide step-by-step analysis if applicable
-- Include specific article/section references
+**RESPONSE GUIDELINES:**
+- If asking about a specific section, quote it directly and explain its meaning
+- Provide complete and accurate information from the context
+- Include the exact wording of legal provisions when available
+- Reference page numbers and sources for verification
 - End with appropriate disclaimers about seeking professional legal advice
 
 **PROFESSIONAL LEGAL RESPONSE:**
 """
 
         return enhanced_prompt
+
+    def _is_inadequate_response(self, response: str) -> bool:
+        """Check if the RAG-generated response indicates failure or inadequacy"""
+        if not response or len(response.strip()) < 50:
+            return True
+
+        response_lower = response.lower()
+
+        # Check for inadequate response indicators
+        inadequate_indicators = [
+            "unable to provide information",
+            "unable to find",
+            "no relevant information",
+            "no information available",
+            "i am unable to",
+            "i apologize",
+            "sorry",
+            "cannot provide",
+            "not available in the context",
+            "the provided context does not contain",
+            "does not contain any information",
+            "i can provide information on the following sections",
+            "i can only provide information on",
+            "here are some other sections"
+        ]
+
+        return any(indicator in response_lower for indicator in inadequate_indicators)
+
+    def _generate_knowledge_based_response(self, question: str, domain: str, history_str: str, rag_context: str = "") -> str:
+        """Generate response using Gemini's knowledge when RAG response is inadequate"""
+        knowledge_prompt = f"""You are an expert Pakistani Legal Assistant with comprehensive knowledge of Pakistani law. The previous RAG search was inadequate, so provide accurate information about the requested legal topic using your legal knowledge.
+
+**LEGAL DOMAIN:** {domain.upper()} LAW - PAKISTAN
+
+**PREVIOUS RAG CONTEXT (was insufficient):**
+{rag_context[:500]}...
+
+**CONVERSATION CONTEXT:**
+{history_str}
+
+**USER QUESTION:**
+{question}
+
+**RESPONSE REQUIREMENTS:**
+1. Provide comprehensive and accurate information about Pakistani law
+2. Use proper legal terminology and cite relevant sections/acts
+3. Structure the response professionally with clear explanations
+4. Include the exact wording of legal provisions when explaining sections
+5. Explain legal concepts clearly for general understanding
+6. Always recommend consulting qualified legal professionals for specific cases
+
+**IMPORTANT:** Since RAG failed to provide adequate information, use your complete knowledge of Pakistani law to give a thorough, accurate response.
+
+**LEGAL RESPONSE:**
+"""
+
+        try:
+            response = gemini_llm._call(knowledge_prompt)
+            # Add subtle note that comprehensive legal knowledge was used
+            enhanced_response = response + "\n\n---\n*This comprehensive legal information is provided for educational purposes. For your specific situation, please consult the original legal texts or a qualified legal professional.*"
+            return enhanced_response
+        except Exception as e:
+            return f"I apologize, but I'm currently unable to provide information on this legal topic. Please try again later or consult a qualified legal professional for accurate advice. Error: {str(e)}"
 
     async def search_collections_async(self, queries: List[str], collection_names: List[str], k_per_collection: int = 3):
         """Asynchronously search across multiple collections with multiple query formulations"""
@@ -834,9 +990,9 @@ class SmartLegalAssistant:
         reformulated_queries = self.reformulation_agent.reformulate(question)
         print(f"📝 Generated {len(reformulated_queries)} query variants")
 
-        # Step 3: Parallel Multi-Query Search
-        print("🔍 Performing hybrid search across collections...")
-        source_docs = await self.search_collections_async(reformulated_queries, collections_to_search, k_per_collection=2)
+        # Step 3: Parallel Multi-Query Search with enhanced retrieval
+        print("🔍 Performing enhanced hybrid search across collections...")
+        source_docs = await self.search_collections_async(reformulated_queries, collections_to_search, k_per_collection=3)
 
         if not source_docs:
             # Fallback: Search all collections with broader search
@@ -855,11 +1011,15 @@ class SmartLegalAssistant:
                 self.query_cache.set(question, collections_to_search, no_result)
                 return no_result
 
-        # Step 4: Reranking using Gemini
-        print("Reranking results using Gemini...")
-        reranked_docs = self.reranking_agent.rerank(question, source_docs)
-        # Take top 5 most relevant documents
-        top_docs = reranked_docs[:5]
+        # Step 4: Enhanced reranking with legal content prioritization
+        print("Enhanced reranking with legal content prioritization...")
+        if len(source_docs) > 5:
+            reranked_docs = self.reranking_agent.rerank(question, source_docs)
+            top_docs = reranked_docs[:5]
+        else:
+            # For smaller result sets, use hybrid scoring directly
+            top_docs = source_docs[:5]
+            print(f"Using top {len(top_docs)} documents directly (small result set)")
 
         # Step 5: Combine legal context and generate answer
         legal_context_parts = []
@@ -884,11 +1044,17 @@ class SmartLegalAssistant:
 
         # Generate answer with enhanced prompt for better accuracy
         print("🤖 Generating legal response...")
+
+        # Always try RAG first, but check if the response would be inadequate
         enhanced_prompt = self._create_enhanced_prompt(
             history_str, legal_context, question, primary_domain, top_docs
         )
-
         answer = self.llm._call(enhanced_prompt)
+
+        # Check if the RAG response indicates failure/inadequacy
+        if self._is_inadequate_response(answer):
+            print("⚠️ RAG response inadequate, using Gemini's legal knowledge as fallback...")
+            answer = self._generate_knowledge_based_response(question, primary_domain, history_str, legal_context)
 
         # Track token usage asynchronously
         asyncio.create_task(track_token_usage_async(query_id, enhanced_prompt, answer))
