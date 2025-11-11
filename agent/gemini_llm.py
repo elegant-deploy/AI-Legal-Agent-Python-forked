@@ -23,7 +23,9 @@ class GeminiLLM(LLM):
         """Call Gemini with retry logic"""
         for attempt in range(self.max_retries):
             try:
-                print(f"Calling Gemini API (attempt {attempt + 1}/{self.max_retries})...")
+                # print(f"🔴 Calling Gemini API (attempt {attempt + 1}/{self.max_retries})...")
+                print(f"🔴")
+
 
                 model = genai.GenerativeModel(self.model_name)
                 response = model.generate_content(

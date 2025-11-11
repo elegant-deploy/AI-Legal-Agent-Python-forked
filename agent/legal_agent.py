@@ -9,7 +9,7 @@ from chromadb.utils import embedding_functions
 from config.settings import settings
 from helper.token_tracker import track_token_usage_async
 from rank_bm25 import BM25Okapi
-from agent.gemini_llm import gemini_llm
+from agent.gemini_llm import gemini_llm 
 import numpy as np
 import asyncio
 import hashlib
@@ -108,7 +108,9 @@ class OpenRouterLLM(LLM):
         print("🤖 Generating legal response...")
         gemini_response = gemini_llm._call_with_retry(prompt, stop)
         if not gemini_response.startswith("[Gemini Error]"):
-            print("✅ Gemini API call successful")
+            # print("✅ Gemini API call successful")
+            print("✅ Call successful")
+
             return gemini_response
 
         print("⚠️ Gemini failed, falling back to OpenRouter...")
@@ -129,7 +131,7 @@ class OpenRouterLLM(LLM):
             # Enforce rate limiting
             self._enforce_rate_limit()
 
-            print("Calling OpenRouter API (fallback attempt)...")
+            print("🔴 Calling OpenRouter API (fallback attempt)...")
             resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
 
             if resp.status_code == 429:
@@ -252,34 +254,54 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                     self.bm25_index = None
 
             def _keyword_search(self, query: str, top_k: int = 10):
-                """Perform BM25 keyword search with enhanced matching"""
+                """Perform enhanced BM25 keyword search with legal term extraction"""
                 if not self.bm25_index:
                     return []
 
-                # Enhanced query preprocessing
+                # Enhanced legal query preprocessing
                 query_lower = query.lower()
-                # Extract numbers and legal terms more precisely
                 import re
-                numbers = re.findall(r'\d+', query_lower)
-                legal_terms = re.findall(r'section\s+\d+|article\s+\d+|clause\s+\d+', query_lower, re.IGNORECASE)
 
-                # Build search terms
-                query_tokens = query_lower.split()
-                if numbers:
-                    query_tokens.extend(numbers)  # Add numbers as separate tokens
-                if legal_terms:
-                    query_tokens.extend(legal_terms)
+                # Extract legal-specific terms
+                legal_patterns = [
+                    r'section\s+(\d+)', r'article\s+(\d+)', r'clause\s+(\d+)',
+                    r'chapter\s+(\d+)', r'part\s+(\d+)', r'sub-section\s+(\d+)',
+                    r'paragraph\s+(\d+)', r'schedule\s+(\d+)'
+                ]
+
+                legal_terms = []
+                for pattern in legal_patterns:
+                    matches = re.findall(pattern, query_lower, re.IGNORECASE)
+                    legal_terms.extend([f"{re.match(pattern, query_lower, re.IGNORECASE).group(0)}" for match in matches])
+
+                # Extract standalone numbers (likely section references)
+                numbers = re.findall(r'\b\d+\b', query_lower)
+                section_numbers = [num for num in numbers if len(num) <= 4]  # Section numbers are typically short
+
+                # Build comprehensive search terms
+                query_tokens = []
+                query_tokens.extend(query_lower.split())  # Original tokens
+                query_tokens.extend(legal_terms)  # Legal references
+                query_tokens.extend(section_numbers)  # Section numbers
+                query_tokens.extend([f"section {num}" for num in section_numbers])  # Section prefixes
+
+                # Add legal domain-specific terms
+                legal_keywords = ['law', 'act', 'ordinance', 'code', 'court', 'justice', 'legal', 'provision']
+                query_tokens.extend([kw for kw in legal_keywords if kw in query_lower])
 
                 # Remove duplicates while preserving order
                 seen = set()
                 query_tokens = [x for x in query_tokens if not (x in seen or seen.add(x))]
+
+                # Remove very short tokens that aren't numbers
+                query_tokens = [token for token in query_tokens if len(token) > 1 or token.isdigit()]
 
                 bm25_scores = self.bm25_index.get_scores(query_tokens)
                 top_indices = np.argsort(bm25_scores)[::-1][:top_k]
 
                 keyword_docs = []
                 for idx in top_indices:
-                    if bm25_scores[idx] > 0.1:  # Lower threshold for better recall
+                    if bm25_scores[idx] > 0.05:  # Very low threshold for maximum recall
                         from langchain_core.documents import Document
                         doc = Document(
                             page_content=self.documents[idx],
@@ -288,7 +310,9 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                                 'collection_name': self.collection_name,
                                 'search_score': float(bm25_scores[idx]),
                                 'search_type': 'keyword',
-                                'matched_tokens': query_tokens
+                                'matched_tokens': query_tokens,
+                                'legal_terms_found': legal_terms,
+                                'section_numbers': section_numbers
                             }
                         )
                         keyword_docs.append(doc)
@@ -325,53 +349,101 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                     print(f"Error in semantic search for {self.collection_name}: {e}")
                     return []
 
-            def _hybrid_rerank(self, semantic_docs: List, keyword_docs: List, alpha: float = 0.6):
-                """Combine semantic and keyword results with enhanced reranking"""
+            def _hybrid_rerank(self, semantic_docs: List, keyword_docs: List, alpha: float = 0.5):
+                """Enhanced hybrid reranking with legal content prioritization"""
                 # Create a combined set of unique documents
                 all_docs = {}
                 doc_scores = {}
-                doc_sources = {}  # Track source for better scoring
+                doc_sources = {}
+                doc_metadata = {}  # Store additional scoring metadata
 
-                # Add semantic search results with higher base weight
+                # Add semantic search results with base weight
                 for doc in semantic_docs:
                     doc_id = doc.metadata.get('doc_id')
                     all_docs[doc_id] = doc
                     doc_scores[doc_id] = alpha
                     doc_sources[doc_id] = 'semantic'
+                    doc_metadata[doc_id] = {'semantic_score': alpha, 'keyword_score': 0}
 
-                # Add keyword search results with boosted scoring for legal content
+                # Add keyword search results with enhanced legal scoring
                 for doc in keyword_docs:
                     doc_id = doc.metadata.get('doc_id')
                     base_score = doc.metadata.get('search_score', 0)
 
-                    # Boost score for documents containing legal section numbers
+                    # Enhanced legal content scoring
                     content = doc.page_content.lower()
-                    query_terms = doc.metadata.get('matched_tokens', [])
                     legal_boost = 0
+                    precision_boost = 0
 
-                    # Check for section/article numbers in content
-                    for term in query_terms:
-                        if term.isdigit() and len(term) <= 4:  # Likely a section number
-                            if term in content:
-                                legal_boost += 0.3  # Significant boost for exact matches
-                        elif 'section' in term.lower() and any(char.isdigit() for char in term):
-                            if term.lower() in content:
-                                legal_boost += 0.4  # Even higher boost for section references
+                    # Extract legal terms and section numbers from metadata
+                    legal_terms = doc.metadata.get('legal_terms_found', [])
+                    section_numbers = doc.metadata.get('section_numbers', [])
+                    matched_tokens = doc.metadata.get('matched_tokens', [])
 
-                    keyword_score = (1 - alpha) * (base_score + legal_boost)
+                    # Boost for exact legal term matches
+                    for term in legal_terms:
+                        if term.lower() in content:
+                            legal_boost += 0.5  # High boost for legal terms
+
+                    # Boost for section number matches
+                    for num in section_numbers:
+                        if num in content:
+                            precision_boost += 0.8  # Very high boost for section numbers
+                        # Also check for "section X" patterns
+                        if f"section {num}" in content:
+                            precision_boost += 1.0  # Maximum boost for exact section references
+
+                    # Boost for legal keywords
+                    legal_keywords = ['shall', 'provided that', 'notwithstanding', 'hereby', 'hereinafter']
+                    for keyword in legal_keywords:
+                        if keyword in content:
+                            legal_boost += 0.1
+
+                    # Calculate final keyword score
+                    keyword_score = (1 - alpha) * (base_score + legal_boost + precision_boost)
 
                     if doc_id in all_docs:
-                        # Combine scores for documents found in both
+                        # Combine scores for documents found in both searches
                         doc_scores[doc_id] += keyword_score
                         doc_sources[doc_id] = 'hybrid'
+                        doc_metadata[doc_id]['keyword_score'] = keyword_score
+                        doc_metadata[doc_id]['combined_score'] = doc_scores[doc_id]
                     else:
                         # New document from keyword search
                         all_docs[doc_id] = doc
                         doc_scores[doc_id] = keyword_score
                         doc_sources[doc_id] = 'keyword'
+                        doc_metadata[doc_id] = {
+                            'semantic_score': 0,
+                            'keyword_score': keyword_score,
+                            'combined_score': keyword_score
+                        }
 
-                # Sort by combined score and return top k
-                sorted_docs = sorted(all_docs.values(), key=lambda x: doc_scores[x.metadata['doc_id']], reverse=True)
+                # Apply legal relevance filtering - prioritize documents with legal content
+                filtered_docs = []
+                for doc_id, doc in all_docs.items():
+                    score = doc_scores[doc_id]
+                    content = doc.page_content.lower()
+
+                    # Minimum relevance threshold
+                    if score < 0.1:
+                        continue
+
+                    # Boost documents that contain legal structure indicators
+                    legal_indicators = ['section', 'article', 'clause', 'provided', 'shall', 'act', 'law', 'ordinance']
+                    legal_indicator_count = sum(1 for indicator in legal_indicators if indicator in content)
+
+                    if legal_indicator_count > 0:
+                        score += legal_indicator_count * 0.05  # Small boost for legal content
+
+                    # Update final score
+                    doc_scores[doc_id] = score
+                    doc.metadata['final_score'] = score
+                    doc.metadata['search_source'] = doc_sources[doc_id]
+                    filtered_docs.append(doc)
+
+                # Sort by final score and return top k
+                sorted_docs = sorted(filtered_docs, key=lambda x: doc_scores[x.metadata['doc_id']], reverse=True)
                 return sorted_docs[:self.k]
 
             def get_relevant_documents(self, query):
@@ -421,10 +493,35 @@ Return only the reformulated queries, one per line.""",
         )
 
     def reformulate(self, question: str) -> List[str]:
-        """Reformulate the query into multiple search variants using Gemini"""
+        """Enhanced query reformulation for legal search using Gemini"""
         try:
-            prompt = self.prompt.format(question=question)
-            response = gemini_llm._call(prompt)
+            # Enhanced prompt for better legal query generation
+            enhanced_prompt = f"""You are an expert legal query reformulation specialist. Your task is to create multiple precise search queries that will effectively retrieve legal information from document databases.
+
+**ORIGINAL QUESTION:** {question}
+
+**LEGAL REFORMULATION REQUIREMENTS:**
+1. **Extract Legal Intent**: Identify if the question seeks specific sections, general concepts, or procedural information
+2. **Generate Precise Variants**: Create queries that target exact legal terminology
+3. **Include Legal References**: If asking about sections/articles, include both numbered and descriptive forms
+4. **Domain-Specific Terms**: Use appropriate legal terminology for the domain (family, corporate, criminal, traffic)
+5. **Multiple Search Angles**: Provide different phrasings that might match document content
+
+**REFORMULATED SEARCH QUERIES:**
+- Query 1: [Most precise legal formulation - include section numbers if mentioned]
+- Query 2: [Alternative legal terminology or broader related concept]
+- Query 3: [Procedural or practical angle of the same legal question]
+
+**EXAMPLES:**
+For "What is section 5 of family law?":
+- Query 1: "section 5 muslim family laws ordinance"
+- Query 2: "family law section 5 marriage requirements"
+- Query 3: "nikah requirements under section 5"
+
+Return only the reformulated queries, one per line starting with "- Query X:".
+"""
+
+            response = gemini_llm._call(enhanced_prompt)
 
             # Parse the response to extract queries
             queries = []
@@ -434,18 +531,49 @@ Return only the reformulated queries, one per line.""",
                     # Extract the query text after the colon
                     if ':' in line:
                         query = line.split(':', 1)[1].strip()
-                        if query:
+                        if query and len(query) > 3:  # Minimum length check
                             queries.append(query)
 
-            # If parsing failed, return original and basic variants
-            if not queries:
-                queries = [question]
+            # If parsing failed or insufficient queries, create basic variants
+            if len(queries) < 2:
+                # Create basic legal variants
+                import re
+                question_lower = question.lower()
 
-            # Ensure we have at least the original
+                # Extract potential section numbers
+                section_matches = re.findall(r'section\s+(\d+)', question_lower, re.IGNORECASE)
+                if section_matches:
+                    section_num = section_matches[0]
+                    queries.extend([
+                        question,  # Original
+                        f"section {section_num} legal provision",
+                        f"legal section {section_num} requirements"
+                    ])
+                else:
+                    # General legal reformulation
+                    legal_terms = ['law', 'act', 'ordinance', 'code', 'court']
+                    domain_indicators = ['family', 'marriage', 'divorce', 'corporate', 'company', 'traffic', 'criminal', 'ppc']
+
+                    domain = next((d for d in domain_indicators if d in question_lower), 'legal')
+                    queries.extend([
+                        question,  # Original
+                        f"{domain} law {question}",
+                        f"pakistan {domain} legal requirements"
+                    ])
+
+            # Ensure we have at least the original question
             if question not in queries:
                 queries.insert(0, question)
 
-            return queries[:3]  # Limit to 3 queries
+            # Remove duplicates and limit to 3
+            seen = set()
+            unique_queries = []
+            for q in queries:
+                if q not in seen:
+                    seen.add(q)
+                    unique_queries.append(q)
+
+            return unique_queries[:3]
 
         except Exception as e:
             print(f"Query reformulation error: {e}")
@@ -796,7 +924,7 @@ class SmartLegalAssistant:
 
     def _generate_knowledge_based_response(self, question: str, domain: str, history_str: str, rag_context: str = "") -> str:
         """Generate response using Gemini's knowledge when RAG response is inadequate"""
-        knowledge_prompt = f"""You are an expert Pakistani Legal Assistant with comprehensive knowledge of Pakistani law. The previous RAG search was inadequate, so provide accurate information about the requested legal topic using your legal knowledge.
+        knowledge_prompt = f"""You are an expert Pakistani Legal Assistant with comprehensive knowledge of Pakistani law. The previous RAG search was inadequate, so provide accurate information about the requested legal topic using your legal knowledge, but don't mention anywhere that rag content is inadequate in answer.
 
 **LEGAL DOMAIN:** {domain.upper()} LAW - PAKISTAN
 
@@ -916,11 +1044,11 @@ class SmartLegalAssistant:
         # Generate unique query ID
         query_id = str(uuid.uuid4())
 
-        print("Starting multi-agent legal analysis...")
+        print("🚀 multi-agent legal analysis...")
 
         # Check if decision-making is enabled and use LangGraph flow
         if self.decision_enabled and self.decision_flow:
-            print("Using Decision-Making Flow...")
+            print("⚖️ Using Decision-Making Flow...")
             try:
                 decision_result = await self.decision_flow.process_query(question)
 
@@ -950,10 +1078,10 @@ class SmartLegalAssistant:
                 # Fall back to traditional RAG
 
         # Traditional RAG flow (fallback or when decision-making disabled)
-        print("Using Traditional RAG Flow...")
+        print("⚖️ Using Traditional RAG Flow...")
 
         # Step 1: Query Classification using Gemini
-        print("Classifying query domain using Gemini...")
+        print("🧠 Classifying query domain using Gemini...")
         classification = self.classification_agent.classify(question)
         domain = classification['primary_domain']
         all_domains = classification['all_domains']
@@ -986,13 +1114,14 @@ class SmartLegalAssistant:
             return cached_result
 
         # Step 2: Query Reformulation using Gemini
-        print("Reformulating query using Gemini...")
+        print("🔄 Reformulating query using Gemini...")
         reformulated_queries = self.reformulation_agent.reformulate(question)
         print(f"📝 Generated {len(reformulated_queries)} query variants")
 
         # Step 3: Parallel Multi-Query Search with enhanced retrieval
         print("🔍 Performing enhanced hybrid search across collections...")
-        source_docs = await self.search_collections_async(reformulated_queries, collections_to_search, k_per_collection=3)
+        print(f"   Search queries: {reformulated_queries}")
+        source_docs = await self.search_collections_async(reformulated_queries, collections_to_search, k_per_collection=4)
 
         if not source_docs:
             # Fallback: Search all collections with broader search
@@ -1012,13 +1141,14 @@ class SmartLegalAssistant:
                 return no_result
 
         # Step 4: Enhanced reranking with legal content prioritization
-        print("Enhanced reranking with legal content prioritization...")
-        if len(source_docs) > 5:
+        print(f"📊 Retrieved {len(source_docs)} total documents, applying enhanced reranking...")
+        if len(source_docs) > 3:
             reranked_docs = self.reranking_agent.rerank(question, source_docs)
-            top_docs = reranked_docs[:5]
+            top_docs = reranked_docs[:6]  # Increased to 6 for better coverage
+            print(f" 📊  Reranked to top {len(top_docs)} documents")
         else:
             # For smaller result sets, use hybrid scoring directly
-            top_docs = source_docs[:5]
+            top_docs = source_docs[:6]
             print(f"Using top {len(top_docs)} documents directly (small result set)")
 
         # Step 5: Combine legal context and generate answer
@@ -1045,16 +1175,20 @@ class SmartLegalAssistant:
         # Generate answer with enhanced prompt for better accuracy
         print("🤖 Generating legal response...")
 
-        # Always try RAG first, but check if the response would be inadequate
+        # Always try RAG first with enhanced prompt
+        print("🤖 Generating response using enhanced RAG prompt...")
         enhanced_prompt = self._create_enhanced_prompt(
             history_str, legal_context, question, primary_domain, top_docs
         )
         answer = self.llm._call(enhanced_prompt)
 
-        # Check if the RAG response indicates failure/inadequacy
-        if self._is_inadequate_response(answer):
-            print("⚠️ RAG response inadequate, using Gemini's legal knowledge as fallback...")
+        # Enhanced response validation - check for adequacy
+        if self._is_inadequate_response(answer) or len(answer.strip()) < 100:
+            print("⚠️ RAG content inadequate, using external resources and comprehensive legal knowledge as fallback...")
             answer = self._generate_knowledge_based_response(question, primary_domain, history_str, legal_context)
+            print("✅ Fallback response generated using legal knowledge")
+        else:
+            print("✅ RAG response adequate, proceeding with retrieved content")
 
         # Track token usage asynchronously
         asyncio.create_task(track_token_usage_async(query_id, enhanced_prompt, answer))
