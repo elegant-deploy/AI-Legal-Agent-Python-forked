@@ -1114,7 +1114,7 @@ class SmartLegalAssistant:
             return cached_result
 
         # Step 2: Query Reformulation using Gemini
-        print("🔄 Reformulating query using Gemini...")
+        print("🔄 Reformulating query")
         reformulated_queries = self.reformulation_agent.reformulate(question)
         print(f"📝 Generated {len(reformulated_queries)} query variants")
 

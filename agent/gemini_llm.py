@@ -39,7 +39,7 @@ class GeminiLLM(LLM):
                 )
 
                 if response.text and response.text.strip():
-                    print(f"Gemini API call successful on attempt {attempt + 1}")
+                    print(f" API call successful on attempt {attempt + 1}")
                     return response.text
                 else:
                     print(f"Gemini returned empty response on attempt {attempt + 1}")
