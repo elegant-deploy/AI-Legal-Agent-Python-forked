@@ -45,23 +45,12 @@ async def ask_legal_question(question: str, context=None):
 
         # Step 3: Regular RAG flow for informational queries or fallback
         print(f"Using RAG flow (intent: {intent_result['intent']})")
-        result = await assistant.__call_async(question, context)
+        # Use the sync method which internally handles async operations
+        result = assistant(question, context)
         return {
             "success": True,
             "data": result
         }
-
-    except AttributeError as e:
-        if "'SmartLegalAssistant' object has no attribute '__call_async'" in str(e):
-            # Fallback to sync method if async method doesn't exist
-            print("Falling back to synchronous method...")
-            result = assistant(question, context)
-            return {
-                "success": True,
-                "data": result
-            }
-        else:
-            raise
     except Exception as e:
         import traceback
         print(f"Error in ask_legal_question: {str(e)}")

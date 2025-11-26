@@ -1,13 +1,14 @@
 import os
 import re
+import hashlib
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
-from chromadb.utils import embedding_functions
 from config.settings import settings
-import numpy as np
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
+from huggingface_hub import InferenceClient
 
 # Domain detection from filenames
 DOMAIN_KEYWORDS = {
@@ -54,13 +55,17 @@ def extract_text_with_metadata(pdf_path: str):
     if not p.exists():
         raise FileNotFoundError(f"PDF not found at '{pdf_path}'")
 
+    # Compute PDF hash for deterministic IDs
+    with open(pdf_path, 'rb') as f:
+        pdf_hash = hashlib.sha256(f.read()).hexdigest()
+
     reader = PdfReader(str(p))
     documents = []
 
     # Detect domain from filename
     domain = detect_domain_from_filename(p.name)
 
-    print(f"📖 Reading PDF: {p.name}")
+    print(f"📖 Reading PDF: {p.name} (hash: {pdf_hash[:8]}...)")
     for i, page in enumerate(reader.pages):
         text = page.extract_text()
         if text:
@@ -74,7 +79,8 @@ def extract_text_with_metadata(pdf_path: str):
                         'document_type': 'legal',
                         'jurisdiction': 'Pakistan',
                         'source_type': 'pdf',
-                        'domain': domain
+                        'domain': domain,
+                        'pdf_hash': pdf_hash
                     }
                 })
         # Show progress for large PDFs
@@ -84,7 +90,7 @@ def extract_text_with_metadata(pdf_path: str):
     if not documents:
         raise ValueError("No text extracted from PDF.")
 
-    return documents, domain
+    return documents, domain, pdf_hash
 
 def smart_chunking(documents, chunk_size=500, chunk_overlap=150):
     """Advanced sliding window chunking that preserves legal document structure and improves retrieval"""
@@ -217,12 +223,46 @@ def list_existing_collections():
         print(f"❌ Error listing collections: {e}")
         return []
 
-def ingest_pdf(pdf_path: str, force: bool = False):
-    """Main function to ingest PDF into ChromaDB"""
+def get_hf_embeddings(texts, api_key, model):
+    """Get embeddings from Hugging Face Inference API"""
+    try:
+        client = InferenceClient(model=model, token=api_key)
+        embeddings = client.feature_extraction(texts)
+        # Ensure embeddings are list of lists of floats
+        return [list(map(float, emb)) for emb in embeddings]
+    except Exception as e:
+        print(f"Error calling HF Inference API: {e}")
+        raise
+
+def compute_embeddings(chunks, api_key, model):
+    """Compute embeddings for chunks"""
+    texts = [chunk['content'] for chunk in chunks]
+    print(f"🧮 Computing embeddings for {len(texts)} chunks...")
+    batch_size = settings.EMBED_BATCH_SIZE
+    total_batches = (len(texts) + batch_size - 1) // batch_size
+    embeddings = []
+
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
+        batch_num = (i // batch_size) + 1
+        print(f"   📤 Embedding batch {batch_num}/{total_batches} ({len(batch_texts)} texts)...")
+        try:
+            batch_embs = get_hf_embeddings(batch_texts, api_key, model)
+            # Ensure embeddings are lists of floats
+            batch_embs = [list(emb) for emb in batch_embs]
+            embeddings.extend(batch_embs)
+        except Exception as e:
+            print(f"❌ Error computing batch {batch_num}: {e}")
+            raise
+
+    return embeddings
+
+def ingest_pdf(pdf_path: str, force: bool = False, dry_run: bool = False):
+    """Main function to ingest PDF into ChromaDB with BGE-M3 embeddings"""
     client = create_chroma_client()
 
     # Extract documents and detect domain
-    documents, domain = extract_text_with_metadata(pdf_path)
+    documents, domain, pdf_hash = extract_text_with_metadata(pdf_path)
     collection_name = get_collection_name(domain, Path(pdf_path).name)
 
     print(f"\n🎯 Detected Domain: {domain.upper()}")
@@ -233,9 +273,9 @@ def ingest_pdf(pdf_path: str, force: bool = False):
         existing_collections = client.list_collections()
         existing_names = [col.name for col in existing_collections]
 
-        if collection_name in existing_names and not force:
+        if collection_name in existing_names and not force and not dry_run:
             return False, collection_name, "Collection already exists. Use force=True to recreate."
-        elif collection_name in existing_names and force:
+        elif collection_name in existing_names and force and not dry_run:
             print(f"🗑️  Deleting existing collection '{collection_name}'...")
             client.delete_collection(name=collection_name)
     except Exception as e:
@@ -259,28 +299,19 @@ def ingest_pdf(pdf_path: str, force: bool = False):
     for i, chunk_data in enumerate(chunks):
         documents_list.append(chunk_data['content'])
         metadatas_list.append(chunk_data['metadata'])
-        ids_list.append(f"chunk_{i:04d}")
+        # Deterministic unique ID: collection_name + pdf_hash + global_index
+        ids_list.append(f"{collection_name}_{pdf_hash}_{i:06d}")
 
-    try:
-        # Try to use Qwen model if available, fallback to MiniLM
-        embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        print("   Using all-MiniLM-L6-v2 for embeddings")
-    except Exception as e:
-        print(f"   Warning: Could not load preferred embedder: {e}")
-        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    # Compute embeddings
+    embeddings_list = compute_embeddings(chunks, settings.HF_API_KEY, settings.HF_EMBED_MODEL)
 
-    embeddings = embedder.encode(documents_list, show_progress_bar=True, convert_to_numpy=True)
+    if dry_run:
+        print(f"🔍 Dry run: Would upload {len(embeddings_list)} embeddings to collection '{collection_name}'")
+        return True, collection_name, f"Dry run complete for {len(embeddings_list)} chunks"
 
-    # Create collection and upload with optimized embedding function
+    # Create collection and upload
     print(f"🚀 Creating collection '{collection_name}'...")
-    try:
-        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        print("   Using all-MiniLM-L6-v2 embedding function")
-    except Exception as e:
-        print(f"   Warning: Could not load preferred embedding function: {e}")
-        ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-
-    collection = client.create_collection(name=collection_name, embedding_function=ef)
+    collection = client.create_collection(name=collection_name)
 
     # Upload in batches
     batch_size = 100
@@ -292,12 +323,16 @@ def ingest_pdf(pdf_path: str, force: bool = False):
 
         print(f"📤 Uploading batch {batch_num}/{total_batches} ({end_idx-i} documents)...")
 
-        collection.add(
-            documents=documents_list[i:end_idx],
-            embeddings=embeddings[i:end_idx].tolist(),
-            metadatas=metadatas_list[i:end_idx],
-            ids=ids_list[i:end_idx]
-        )
+        try:
+            collection.add(
+                documents=documents_list[i:end_idx],
+                embeddings=embeddings_list[i:end_idx],
+                metadatas=metadatas_list[i:end_idx],
+                ids=ids_list[i:end_idx]
+            )
+        except Exception as e:
+            print(f"❌ Error uploading batch {batch_num}: {e}")
+            raise
 
     # Verify upload
     count = collection.count()

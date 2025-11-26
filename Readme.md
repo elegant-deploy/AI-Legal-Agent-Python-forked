@@ -27,10 +27,11 @@ The system features intelligent domain detection, multi-collection searching, an
 - **🤖 Smart Legal Assistant**: AI-powered legal research and Q&A
 - **🏷️ Multi-Domain Support**: Traffic, Family, Corporate, and PPC law domains
 - **🔍 Intelligent Query Routing**: Automatic domain detection and collection selection
-- **📚 Vector-Based Search**: ChromaDB-powered semantic search
+- **📚 Advanced Vector Search**: BGE-M3 embeddings for high-accuracy semantic search
+- **🔄 Cross-Encoder Reranking**: BGE-reranker-base for precise result ranking
 - **🌐 RESTful API**: FastAPI-based modern API endpoints
-- **📄 PDF Ingestion**: Automated processing of legal documents
-- **⚡ High Performance**: Optimized for fast response times
+- **📄 PDF Ingestion**: Automated processing with deterministic chunking
+- **⚡ High Performance**: Batch processing and low-latency inference
 - **🔒 Token Tracking**: Comprehensive usage monitoring
 - **☁️ Cloud Ready**: Deployable on any cloud platform
 
@@ -81,23 +82,34 @@ CHROMA_TENANT=your_chroma_tenant
 CHROMA_DATABASE=ai-legal-research-assistant
 OPENROUTER_API_KEY=your_openrouter_api_key
 🚀 Quick Start
-1. Ingest Legal Documents
+1. Configure Environment
+Create a .env file with your API keys:
+
+env
+HF_API_KEY=your_huggingface_api_key
+CHROMA_API_KEY=your_chroma_api_key
+CHROMA_TENANT=your_chroma_tenant
+CHROMA_DATABASE=ai-legal-research-assistant
+OPENROUTER_API_KEY=your_openrouter_api_key
+
+2. Re-ingest Documents with BGE-M3
+Since embeddings have been upgraded to BGE-M3, re-ingestion is required:
+
 bash
-# Ingest Pakistan Penal Code
+# Re-ingest all documents with new embeddings
+python reingest_all.py
+
+# Or ingest individual PDFs
 python -c "
 from controllers.ingest_controller import ingest_pdf
-ingest_pdf('Pakistan Penal Code.pdf', force=True)
+ingest_pdf('Laws/family law.pdf', force=True)
 "
 
-# Ingest Traffic Laws
-python -c "
-from controllers.ingest_controller import ingest_pdf  
-ingest_pdf('Traffic Laws.pdf', force=True)
-"
-2. Start Development Server
+3. Start Development Server
 bash
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-3. Access the API
+
+4. Access the API
 API Documentation: http://localhost:8000/docs
 
 Alternative Docs: http://localhost:8000/redoc
@@ -151,8 +163,20 @@ The project uses ChromaDB Cloud for vector storage. Update your credentials in t
 
 python
 CHROMA_API_KEY = "your_api_key_here"
-CHROMA_TENANT = "your_tenant_id_here" 
+CHROMA_TENANT = "your_tenant_id_here"
 CHROMA_DATABASE = "ai-legal-research-assistant"
+
+Hugging Face Configuration
+Configure Hugging Face API for embeddings and reranking:
+
+python
+HF_API_KEY = "your_huggingface_api_key"
+HF_EMBED_MODEL = "BAAI/bge-m3"  # BGE-M3 embeddings
+HF_RERANKER_MODEL = "BAAI/bge-reranker-large"  # BGE reranker
+EMBED_BATCH_SIZE = 64  # Batch size for embedding requests
+TOP_K = 50  # Number of candidates for reranking
+RERANK_N = 20  # Final results after reranking
+
 OpenRouter Configuration
 Configure your preferred language model:
 

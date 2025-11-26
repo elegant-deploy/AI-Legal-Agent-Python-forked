@@ -2,19 +2,19 @@ import os
 import requests
 import chromadb
 import uuid
+import json
 from langchain_core.prompts import PromptTemplate
 from langchain_core.language_models import LLM
 from typing import Optional, List, Tuple
-from chromadb.utils import embedding_functions
 from config.settings import settings
 from helper.token_tracker import track_token_usage_async
 from rank_bm25 import BM25Okapi
-from agent.gemini_llm import gemini_llm 
+from agent.gemini_llm import gemini_llm
 import numpy as np
 import asyncio
 import hashlib
-import json
 from functools import lru_cache
+from tenacity import retry, stop_after_attempt, wait_exponential
 import time
 
 # ------------------ OpenRouter Config ------------------
@@ -28,7 +28,7 @@ DOMAIN_KEYWORDS = {
     
     'family': ['family', 'marriage','witness','nikah witness','nikah', 'divorce', 'inheritance', 'guardian', 'child', 'maintenance', 'custody', 'dowry','dower','marital', "alimony", "child support", "adoption", "domestic violence", "family dispute", "nikaah", "mehr", "talaq", "khula", "wasiat","pakistan family law","family court","family act","family ordinance"],
     
-    'corporate': ['corporate', 'company', 'business', 'commercial', 'contract', 'partnership', 'incorporation', 'shareholder', 'director', 'board','leaves', 'employee', 'employment', 'labor', 'workplace', 'hr', 'human resources', 'termination', 'hiring', 'firing', 'work hours', 'overtime', 'payroll', 'benefits', 'discrimination', 'harassment', 'workplace safety','pakistan labor law','pakistan employment law','labor court','employment act','industrial relations','maternity', 'paternity', 'casual', 'sick leave', 'annual leave', 'leave policy'],
+    'corporate': ['corporate', 'company', 'business','factories', 'factories act', 'commercial', 'eobi', 'EOBI’s', ' eobi’s ', 'contract', 'partnership', 'incorporation', 'shareholder', 'director', 'board','leaves', 'employee', 'employment', 'labor', 'workplace', 'hr', 'human resources', 'termination', 'hiring', 'firing', 'work hours', 'overtime', 'payroll', 'benefits', 'discrimination', 'harassment', 'workplace safety','pakistan labor law','pakistan employment law','labor court','employment act','industrial relations','maternity', 'paternity', 'casual', 'sick leave', 'annual leave', 'leave policy', 'pension'],
     
     'ppc': [
         # Core PPC terms
@@ -211,15 +211,8 @@ def get_collection_retriever(collection_name: str, k: int = 4):
     """Create a retriever for a specific collection with hybrid search capabilities"""
     client = create_chroma_client()
 
-    embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
-    )
-
     try:
-        collection = client.get_collection(
-            name=collection_name,
-            embedding_function=embedding_function
-        )
+        collection = client.get_collection(name=collection_name)
 
         class HybridCollectionRetriever:
             def __init__(self, collection, k=4):
@@ -254,7 +247,7 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                     self.bm25_index = None
 
             def _keyword_search(self, query: str, top_k: int = 10):
-                """Perform enhanced BM25 keyword search with legal term extraction"""
+                """Perform enhanced BM25 keyword search with legal term extraction and exact matching"""
                 if not self.bm25_index:
                     return []
 
@@ -262,7 +255,7 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                 query_lower = query.lower()
                 import re
 
-                # Extract legal-specific terms
+                # Extract legal-specific terms with better patterns
                 legal_patterns = [
                     r'section\s+(\d+)', r'article\s+(\d+)', r'clause\s+(\d+)',
                     r'chapter\s+(\d+)', r'part\s+(\d+)', r'sub-section\s+(\d+)',
@@ -272,7 +265,10 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                 legal_terms = []
                 for pattern in legal_patterns:
                     matches = re.findall(pattern, query_lower, re.IGNORECASE)
-                    legal_terms.extend([f"{re.match(pattern, query_lower, re.IGNORECASE).group(0)}" for match in matches])
+                    for match in matches:
+                        full_match = re.search(pattern, query_lower, re.IGNORECASE)
+                        if full_match:
+                            legal_terms.append(full_match.group(0))
 
                 # Extract standalone numbers (likely section references)
                 numbers = re.findall(r'\b\d+\b', query_lower)
@@ -286,7 +282,7 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                 query_tokens.extend([f"section {num}" for num in section_numbers])  # Section prefixes
 
                 # Add legal domain-specific terms
-                legal_keywords = ['law', 'act', 'ordinance', 'code', 'court', 'justice', 'legal', 'provision']
+                legal_keywords = ['law', 'act', 'ordinance', 'code', 'court', 'justice', 'legal', 'provision', 'ppc', 'penal', 'criminal']
                 query_tokens.extend([kw for kw in legal_keywords if kw in query_lower])
 
                 # Remove duplicates while preserving order
@@ -296,19 +292,23 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                 # Remove very short tokens that aren't numbers
                 query_tokens = [token for token in query_tokens if len(token) > 1 or token.isdigit()]
 
+                # Get BM25 scores
                 bm25_scores = self.bm25_index.get_scores(query_tokens)
                 top_indices = np.argsort(bm25_scores)[::-1][:top_k]
 
                 keyword_docs = []
                 for idx in top_indices:
-                    if bm25_scores[idx] > 0.05:  # Very low threshold for maximum recall
+                    score = bm25_scores[idx]
+                    # Dynamic threshold based on score distribution
+                    threshold = 0.01 if len(keyword_docs) < 3 else 0.1  # Lower threshold initially for recall
+                    if score > threshold:
                         from langchain_core.documents import Document
                         doc = Document(
                             page_content=self.documents[idx],
                             metadata={
                                 'doc_id': self.doc_ids[idx],
                                 'collection_name': self.collection_name,
-                                'search_score': float(bm25_scores[idx]),
+                                'search_score': float(score),
                                 'search_type': 'keyword',
                                 'matched_tokens': query_tokens,
                                 'legal_terms_found': legal_terms,
@@ -316,13 +316,46 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                             }
                         )
                         keyword_docs.append(doc)
+
+                # If no results with BM25, try exact text matching as fallback
+                if not keyword_docs:
+                    exact_matches = []
+                    for idx, doc_content in enumerate(self.documents):
+                        doc_lower = doc_content.lower()
+                        # Check for exact legal term matches
+                        if any(term.lower() in doc_lower for term in legal_terms):
+                            exact_matches.append(idx)
+                        # Check for section number matches
+                        elif any(f"section {num}" in doc_lower for num in section_numbers):
+                            exact_matches.append(idx)
+                        elif any(num in doc_lower for num in section_numbers):
+                            exact_matches.append(idx)
+
+                    for idx in exact_matches[:top_k]:
+                        from langchain_core.documents import Document
+                        doc = Document(
+                            page_content=self.documents[idx],
+                            metadata={
+                                'doc_id': self.doc_ids[idx],
+                                'collection_name': self.collection_name,
+                                'search_score': 1.0,  # High score for exact matches
+                                'search_type': 'keyword_exact',
+                                'matched_tokens': query_tokens,
+                                'legal_terms_found': legal_terms,
+                                'section_numbers': section_numbers
+                            }
+                        )
+                        keyword_docs.append(doc)
+
                 return keyword_docs
 
             def _semantic_search(self, query: str, top_k: int = 10):
-                """Perform semantic vector search"""
+                """Perform semantic vector search using BGE-M3 with improved error handling"""
                 try:
+                    # Embed query using HF API with timeout
+                    query_emb = get_hf_embeddings([query], settings.HF_API_KEY, settings.HF_EMBED_MODEL)[0]
                     results = self.collection.query(
-                        query_texts=[query],
+                        query_embeddings=[query_emb],
                         n_results=top_k
                     )
 
@@ -346,7 +379,8 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                             documents.append(document)
                     return documents
                 except Exception as e:
-                    print(f"Error in semantic search for {self.collection_name}: {e}")
+                    print(f"Semantic search failed for {self.collection_name}: {type(e).__name__}: {str(e)}")
+                    # Don't fall back here, let the caller handle it
                     return []
 
             def _hybrid_rerank(self, semantic_docs: List, keyword_docs: List, alpha: float = 0.5):
@@ -447,21 +481,44 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                 return sorted_docs[:self.k]
 
             def get_relevant_documents(self, query):
-                """Hybrid search combining semantic and keyword search"""
+                """Sequential search: text/regex first, then semantic/hybrid if needed"""
                 try:
-                    # Parallel execution of semantic and keyword search
-                    semantic_docs = self._semantic_search(query, top_k=self.k * 2)
+                    # Step 1: Try keyword search (text/regex) first for speed and accuracy
                     keyword_docs = self._keyword_search(query, top_k=self.k * 2)
 
-                    # Combine and rerank results
-                    combined_docs = self._hybrid_rerank(semantic_docs, keyword_docs)
+                    if keyword_docs:
+                        # If keyword search found results, return them (rerank if multiple)
+                        if len(keyword_docs) > self.k:
+                            # Simple reranking based on score for keyword results
+                            keyword_docs.sort(key=lambda x: x.metadata.get('search_score', 0), reverse=True)
+                        return keyword_docs[:self.k]
 
-                    return combined_docs
+                    # Step 2: If keyword search failed, try semantic search
+                    print(f"Keyword search found no results for {self.collection_name}, trying semantic search...")
+                    semantic_docs = self._semantic_search(query, top_k=self.k * 2)
+
+                    if semantic_docs:
+                        return semantic_docs[:self.k]
+
+                    # Step 3: If both failed, try hybrid as last resort
+                    print(f"Semantic search also failed for {self.collection_name}, attempting hybrid fallback...")
+                    # Do both searches for hybrid reranking
+                    semantic_docs = self._semantic_search(query, top_k=self.k)
+                    keyword_docs = self._keyword_search(query, top_k=self.k)
+
+                    if semantic_docs or keyword_docs:
+                        combined_docs = self._hybrid_rerank(semantic_docs, keyword_docs)
+                        return combined_docs
+
+                    return []
 
                 except Exception as e:
-                    print(f"Error in hybrid search for {self.collection_name}: {e}")
-                    # Fallback to semantic search only
-                    return self._semantic_search(query, top_k=self.k)
+                    print(f"Error in sequential search for {self.collection_name}: {e}")
+                    # Ultimate fallback: try keyword search only
+                    try:
+                        return self._keyword_search(query, top_k=self.k)
+                    except:
+                        return []
 
         return HybridCollectionRetriever(collection, k=k)
 
@@ -758,6 +815,111 @@ class QueryCache:
         """Clear all cached results"""
         self.cache.clear()
 
+# ------------------ HF Inference Functions ------------------
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_hf_embeddings(texts, api_key, model):
+    """Get embeddings from Hugging Face Inference API with retry"""
+    url = f"https://api-inference.huggingface.co/embeddings/{model}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    data = {"inputs": texts}
+    response = requests.post(url, headers=headers, json=data, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+def get_reranker_scores_batch(inputs, api_key, model):
+    """Get reranker scores from Hugging Face Inference API with fallback models"""
+    # Try multiple reranker models in order of preference
+    models_to_try = [
+        model,  # Original model from settings
+        "BAAI/bge-reranker-large",  # Alternative large model
+        "BAAI/bge-reranker-base",   # Base model
+        "cross-encoder/ms-marco-MiniLM-L-6-v2"  # Fallback cross-encoder
+    ]
+
+    for current_model in models_to_try:
+        try:
+            url = f"https://router.huggingface.co/hf-inference/models/{current_model}"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            data = {"inputs": inputs}
+
+            print(f"🔄 Trying reranker model: {current_model}")
+            response = requests.post(url, headers=headers, json=data, timeout=60)
+
+            if response.status_code == 404:
+                print(f"⚠️ Model {current_model} not found (404), trying next model...")
+                continue
+            elif response.status_code != 200:
+                print(f"⚠️ Reranker API Error for {current_model}: {response.status_code} - {response.text}")
+                continue
+
+            response.raise_for_status()
+            scores = response.json()
+            print(f"✅ Successfully used reranker model: {current_model}")
+            return scores  # list of scores
+
+        except Exception as e:
+            print(f"⚠️ Error with model {current_model}: {type(e).__name__}: {str(e)}")
+            continue
+
+    # If all models fail, raise the last exception
+    raise Exception(f"All reranker models failed. Last error: {str(e) if 'e' in locals() else 'Unknown error'}")
+
+def rerank_with_bge(question, docs):
+    """Rerank documents using BGE reranker with error handling and fallback"""
+    if len(docs) <= 3:
+        # For small result sets, skip reranking to avoid API calls
+        print(f"📊 Small result set ({len(docs)} docs), skipping BGE reranking")
+        return docs
+
+    try:
+        inputs = []
+        for doc in docs:
+            text = f"[QUERY]\n{question}\n\n[DOC]\n{doc.page_content}\n\nReturn a single numeric relevance score between 0 and 1."
+            inputs.append(text)
+
+        print(f"🧮 Computing reranker scores for {len(inputs)} doc pairs...")
+        scores = get_reranker_scores_batch(inputs, settings.HF_API_KEY, settings.HF_RERANKER_MODEL)
+
+        # Sort docs by scores descending
+        doc_score_pairs = list(zip(docs, scores))
+        doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
+        print(f"✅ BGE reranking completed successfully")
+        return [doc for doc, score in doc_score_pairs]
+
+    except Exception as e:
+        print(f"⚠️ BGE reranker failed: {type(e).__name__}: {str(e)}")
+        print(f"📊 Falling back to keyword-based reranking")
+        # Fallback to simple keyword-based reranking
+        return _fallback_keyword_rerank(question, docs)
+
+def _fallback_keyword_rerank(question, docs):
+    """Simple keyword-based reranking as fallback when BGE fails"""
+    question_lower = question.lower()
+    question_words = set(question_lower.split())
+
+    doc_scores = []
+    for doc in docs:
+        content_lower = doc.page_content.lower()
+        score = 0
+
+        # Count exact word matches
+        for word in question_words:
+            if len(word) > 2:  # Skip very short words
+                score += content_lower.count(word)
+
+        # Boost for legal terms
+        legal_terms = ['section', 'article', 'clause', 'act', 'law', 'court', 'case', 'provision']
+        for term in legal_terms:
+            if term in content_lower:
+                score += 0.5
+
+        doc_scores.append((doc, score))
+
+    # Sort by score descending
+    doc_scores.sort(key=lambda x: x[1], reverse=True)
+    print(f"✅ Keyword-based reranking completed for {len(docs)} documents")
+    return [doc for doc, score in doc_scores]
+
 # ------------------ Smart Multi-Agent Legal Assistant ------------------
 class SmartLegalAssistant:
     def __init__(self):
@@ -867,12 +1029,15 @@ class SmartLegalAssistant:
 
 **CRITICAL REQUIREMENTS:**
 1. **LEGAL ACCURACY FIRST**: Base your answer ONLY on the provided legal context
-2. **CITATION MANDATORY**: Always cite specific sections, acts, or provisions from the context
-3. **DIRECT ANSWERS**: If the question asks for a specific section, provide its exact content and explanation
-4. **STRUCTURED FORMAT**: Use clear headings, numbered lists, and professional formatting
-5. **PAKISTANI LAW FOCUS**: Reference Pakistani legal system, courts, and procedures
-6. **CONSERVATIVE ADVICE**: When in doubt, recommend consulting qualified legal professionals
-7. **EVIDENCE-BASED**: Support all claims with references to the provided legal sources
+2. **COMPREHENSIVE ANSWERS**: Provide detailed, thorough explanations with all relevant information from the context
+3. **CITATION MANDATORY**: Always cite specific sections, acts, or provisions from the context with exact wording when available
+4. **DIRECT ANSWERS**: If the question asks for a specific section, provide its exact content and detailed explanation
+5. **STRUCTURED FORMAT**: Use clear headings, numbered lists, bullet points, and professional formatting
+6. **PAKISTANI LAW FOCUS**: Reference Pakistani legal system, courts, and procedures with complete details
+7. **CONSERVATIVE ADVICE**: When in doubt, recommend consulting qualified legal professionals
+8. **EVIDENCE-BASED**: Support all claims with extensive references to the provided legal sources
+9. **CLEAN OUTPUT**: Do NOT include any source document names, collection names, page numbers, or internal references in your final answer
+10. **COMPLETE INFORMATION**: Cover all aspects of the question with comprehensive details, requirements, procedures, and implications
 
 **CONVERSATION CONTEXT:**
 {history_str}
@@ -887,8 +1052,9 @@ class SmartLegalAssistant:
 - If asking about a specific section, quote it directly and explain its meaning
 - Provide complete and accurate information from the context
 - Include the exact wording of legal provisions when available
-- Reference page numbers and sources for verification
+- Do NOT mention document names, collections, or page numbers in the answer
 - End with appropriate disclaimers about seeking professional legal advice
+- Keep the response clean and professional, as if from a legal expert
 
 **PROFESSIONAL LEGAL RESPONSE:**
 """
@@ -907,6 +1073,7 @@ class SmartLegalAssistant:
             "unable to provide information",
             "unable to find",
             "no relevant information",
+            "No Relevant Information",
             "no information available",
             "i am unable to",
             "i apologize",
@@ -1089,21 +1256,26 @@ class SmartLegalAssistant:
         print(f"🎯 Classified Domain: {domain.upper()} (confidence: {classification['confidence']})")
 
         # Get collections for all relevant domains
-        collections_to_search = []
-        for dom in all_domains:
-            domain_collections = [coll for coll in get_all_collections() if dom in coll]
-            collections_to_search.extend(domain_collections)
+        if domain == 'general':
+            # For general queries, immediately search all collections in parallel for maximum coverage
+            collections_to_search = get_all_collections()
+            print(f"📚 General query detected - searching all {len(collections_to_search)} collections in parallel")
+        else:
+            collections_to_search = []
+            for dom in all_domains:
+                domain_collections = [coll for coll in get_all_collections() if dom in coll]
+                collections_to_search.extend(domain_collections)
 
-        # Remove duplicates
-        collections_to_search = list(set(collections_to_search))
+            # Remove duplicates
+            collections_to_search = list(set(collections_to_search))
 
-        if not collections_to_search:
-            return {
-                "result": "❌ No legal document collections found. Please ensure documents have been ingested first.",
-                "source_documents": [],
-                "searched_collections": [],
-                "query_id": query_id
-            }
+            if not collections_to_search:
+                return {
+                    "result": "❌ No legal document collections found. Please ensure documents have been ingested first.",
+                    "source_documents": [],
+                    "searched_collections": [],
+                    "query_id": query_id
+                }
 
         print(f"📚 Collections to search: {len(collections_to_search)}")
 
@@ -1140,15 +1312,22 @@ class SmartLegalAssistant:
                 self.query_cache.set(question, collections_to_search, no_result)
                 return no_result
 
-        # Step 4: Enhanced reranking with legal content prioritization
-        print(f"📊 Retrieved {len(source_docs)} total documents, applying enhanced reranking...")
-        if len(source_docs) > 3:
-            reranked_docs = self.reranking_agent.rerank(question, source_docs)
-            top_docs = reranked_docs[:6]  # Increased to 6 for better coverage
+        # Step 4: BGE reranking for high accuracy
+        print(f"📊 Retrieved {len(source_docs)} total documents, applying BGE reranking...")
+        if len(source_docs) > settings.TOP_K:
+            # Retrieve top_k by hybrid search, then rerank top_n
+            candidate_docs = source_docs[:settings.TOP_K]
+            reranked_docs = rerank_with_bge(question, candidate_docs)
+            top_docs = reranked_docs[:settings.RERANK_N]
+            print(f" 📊  Retrieved top {settings.TOP_K}, reranked to top {len(top_docs)} documents")
+        elif len(source_docs) > settings.RERANK_N:
+            # Rerank available docs
+            reranked_docs = rerank_with_bge(question, source_docs)
+            top_docs = reranked_docs[:settings.RERANK_N]
             print(f" 📊  Reranked to top {len(top_docs)} documents")
         else:
-            # For smaller result sets, use hybrid scoring directly
-            top_docs = source_docs[:6]
+            # For smaller result sets, use directly
+            top_docs = source_docs[:settings.RERANK_N]
             print(f"Using top {len(top_docs)} documents directly (small result set)")
 
         # Step 5: Combine legal context and generate answer
@@ -1156,12 +1335,10 @@ class SmartLegalAssistant:
         domains_used = set()
 
         for doc in top_docs:
-            source_info = f"Page {doc.metadata.get('page_number', 'N/A')}"
-            collection = doc.metadata.get('collection_name', 'Unknown')
             doc_domain = doc.metadata.get('domain', 'general')
             domains_used.add(doc_domain)
 
-            legal_context_parts.append(f"{doc.page_content}\n[Source: {source_info} | Collection: {collection}]")
+            legal_context_parts.append(doc.page_content)
 
         legal_context = "\n\n".join(legal_context_parts)
         primary_domain = domain if domain != "general" else list(domains_used)[0] if domains_used else "general"

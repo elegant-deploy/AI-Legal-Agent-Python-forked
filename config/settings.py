@@ -34,6 +34,14 @@ class Settings:
 
         self.UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER')
 
+        # Hugging Face Embeddings and Reranker Config
+        self.HF_API_KEY = os.getenv('HF_API_KEY')
+        self.HF_EMBED_MODEL = os.getenv('HF_EMBED_MODEL', 'BAAI/bge-m3')
+        self.HF_RERANKER_MODEL = os.getenv('HF_RERANKER_MODEL', 'BAAI/bge-reranker-v2-m3')
+        self.EMBED_BATCH_SIZE = int(os.getenv('EMBED_BATCH_SIZE', 64))
+        self.TOP_K = int(os.getenv('TOP_K', 50))
+        self.RERANK_N = int(os.getenv('RERANK_N', 20))
+
 
     def setup_environment(self):
         """Setup environment variables"""
