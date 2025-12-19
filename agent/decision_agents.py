@@ -2,6 +2,7 @@ import asyncio
 import time
 import hashlib
 import json
+import re
 from typing import Dict, List, Optional, Tuple
 from functools import lru_cache
 from langchain_core.prompts import PromptTemplate
@@ -10,161 +11,292 @@ from langchain_core.documents import Document
 from config.settings import settings
 from agent.gemini_llm import gemini_llm
 
-# ------------------ Decision Intent Detection Agent ------------------
-class DecisionIntentDetectionAgent:
-    """Agent to detect whether a query requires decision-making or is purely informational"""
+# ============================================================================
+# OPTIMIZED MULTI-STAGE INTENT DETECTION (Minimal LLM calls)
+# ============================================================================
+
+class OptimizedIntentDetectionAgent:
+    """
+    Multi-stage intent detection to minimize LLM calls:
+    Stage 1 (FASTEST): Regex patterns for clear cases
+    Stage 2 (FAST): Comprehensive keyword scoring
+    Stage 3 (FALLBACK): Only use LLM for ambiguous cases (~10% of queries)
+    """
 
     def __init__(self, llm: LLM):
         self.llm = llm
-        self.cache = {}  # Simple in-memory cache
-        self.cache_ttl = 3600  # 1 hour TTL
+        self.cache = {}
+        self.cache_ttl = 3600
+        self.llm_call_count = 0  # Track LLM usage
+        self.total_queries = 0
 
-        # Lightweight keyword-based detection for speed
+        # ============================================================
+        # STAGE 1: Regex Patterns (Highest Precision, Zero Cost)
+        # ============================================================
+        
+        # Decision-making patterns
+        self.decision_patterns = [
+            # Seeking action/advice
+            r'\b(should\s+i|what\s+should|how\s+(can\s+)?i|what\s+to\s+do|what\s+are\s+my\s+options)\b',
+            r'\b(need\s+to|have\s+to|must|should)\s+(file|report|sue|appeal|complain|respond)',
+            r'\b(step|procedure|process|action)\s+(plan|i\s+should\s+take)',
+            # Legal remedies
+            r'\b(remedy|compensation|damages|relief|recovery|redress)\b',
+            r'\b(how\s+to\s+(file|report|appeal|challenge|fight))\b',
+            # Personal situations
+            r'\b(i\s+(was|got|received|am).+(ticket|fine|charge|accused|sued))\b',
+            r'\b(against\s+me|wrongfully|unfairly|illegally)\b',
+            # Rights and entitlements
+            r'\b(what\s+are\s+my\s+rights|am\s+i\s+entitled|can\s+i\s+(claim|sue|file))\b',
+        ]
+
+        # Informational patterns
+        self.informational_patterns = [
+            # Pure definitions
+            r'^(what\s+is|define|explain|describe|tell\s+me)\s+',
+            r'\b(definition\s+of|meaning\s+of)\b',
+            # Legal references
+            r'\b(section|article|clause|provision|law\s+states|according\s+to|under\s+)',
+            r'\b(penalty\s+for|punishment\s+for|punishment\s+is|fine\s+for)\b',
+            # Requirements/eligibility
+            r'\b(requirements?\s+for|eligibility|qualifications|who\s+can|when\s+can)\b',
+            r'\b(what\s+is\s+the.*?(process|procedure|rule|law))\b',
+            # List and information requests
+            r'\b(can\s+you\s+(list|tell\s+me|give\s+me|provide|explain))\b',
+            r'\b(list\s+(of|me)|what\s+are\s+the|types\s+of|categories\s+of)\b',
+            # Rights and information seeking
+            r'\b(what\s+are\s+my\s+rights|employee\s+rights|corporate\s+rights)\b',
+        ]
+
+        # ============================================================
+        # STAGE 2: Keyword Sets (Moderate Precision, Instant)
+        # ============================================================
+        
         self.decision_keywords = {
-            'should', 'what should i do', 'how to', 'what to do', 'recommend', 'advice',
-            'action', 'steps', 'procedure', 'process', 'next steps', 'file', 'appeal',
-            'complain', 'report', 'challenge', 'fight', 'defend', 'rights', 'remedy',
-            'solution', 'resolve', 'handle', 'deal with', 'respond to', 'against me',
-            'wrongful', 'unfair', 'illegal', 'violation', 'breach', 'penalty', 'fine',
-            'ticket', 'citation', 'charge', 'accusation', 'complaint', 'lawsuit',
-            'court', 'legal action', 'sue', 'claim', 'compensation', 'damages',
-            'what are my rights', 'my rights', 'rights', 'entitled to', 'entitled',
-            'can i', 'am i entitled', 'do i have right', 'what can i do',
-            'file for', 'apply for', 'get divorce', 'divorce procedure', 'divorce process'
+            # Action verbs
+            'should', 'could', 'can i', 'do i', 'am i', 'will i',
+            # Guidance seeking
+            'advice', 'recommend', 'suggest', 'guidance', 'help',
+            # Procedural
+            'file', 'appeal', 'report', 'sue', 'claim', 'complaint',
+            'challenge', 'fight', 'defend', 'respond', 'reply',
+            # Remedy seeking
+            'remedy', 'compensation', 'damages', 'relief', 'recover',
+            # Rights awareness
+            'rights', 'entitled', 'entitled to', 'my rights', 'legal right',
+            # Problem resolution
+            'resolve', 'handle', 'deal with', 'what to do', 'how to',
+            'next steps', 'procedure', 'process', 'action plan',
+            # Situations
+            'ticket', 'fine', 'charge', 'accused', 'sued', 'against me',
+            'wrongful', 'unfair', 'illegal', 'violation', 'breach',
+            'dispute', 'conflict', 'problem', 'issue',
+            # Specific legal actions
+            'divorce', 'custody', 'inheritance', 'inheritance dispute',
+            'contract dispute', 'employment issue', 'bail', 'bail hearing',
         }
 
         self.informational_keywords = {
-            'what is', 'define', 'meaning', 'explain', 'describe', 'definition',
-            'section', 'article', 'clause', 'provision', 'law states', 'according to',
-            'under', 'penalty for', 'punishment for', 'requirements', 'eligibility'
+            # Definition and explanation
+            'what is', 'define', 'meaning', 'definition', 'explain',
+            'describe', 'difference between', 'tell me about',
+            # Legal reference
+            'section', 'article', 'clause', 'provision', 'act',
+            'ordinance', 'law', 'legal', 'statute', 'code',
+            # Factual questions
+            'penalty', 'punishment', 'fine', 'jail', 'imprisonment',
+            'requirements', 'eligibility', 'who can', 'when can',
+            'where to', 'how much', 'how long', 'how many',
+            # Informational patterns
+            'explain the', 'what are the', 'list of', 'types of',
+            'categories of', 'according to', 'under the', 'can you',
+            # Information seeking
+            'tell me', 'give me', 'provide', 'show me', 'help me understand',
+            'list', 'explain', 'describe', 'what is',
+            # General inquiry
+            'information about', 'details about', 'about the', 'regarding',
         }
 
-        self.prompt = PromptTemplate(
-            template="""You are a legal intent classification expert. Analyze if the query requires decision-making advice or is purely informational.
+        # ============================================================
+        # STAGE 3: LLM Prompt (Used Only for Ambiguous Cases)
+        # ============================================================
+        
+        self.llm_prompt = PromptTemplate(
+            template="""Classify this legal query in ONE word: INFORMATIONAL or DECISION
 
-**QUERY:** {question}
+Query: {question}
 
-**CLASSIFICATION TASK:**
-- INFORMATIONAL: Pure fact-finding, legal definitions, what the law says (e.g., "What is bail?")
-- DECISION-MAKING: Requires advice on what to do, legal actions, remedies, procedures (e.g., "I got a ticket, what should I do?")
-
-**RESPONSE FORMAT:**
-Intent: [INFORMATIONAL or DECISION_MAKING]
-Confidence: [HIGH/MEDIUM/LOW]
-Reason: [brief explanation]
-
-Return only the classification.""",
+Only respond with one word: INFORMATIONAL or DECISION""",
             input_variables=["question"]
         )
 
     def _get_cache_key(self, query: str) -> str:
-        """Generate cache key for query"""
+        """Generate cache key"""
         return hashlib.md5(query.lower().strip().encode()).hexdigest()
 
     def _is_cached(self, key: str) -> Optional[Dict]:
-        """Check if result is cached and not expired"""
+        """Check cache"""
         if key in self.cache:
             entry = self.cache[key]
             if time.time() - entry['timestamp'] < self.cache_ttl:
                 return entry['result']
             else:
-                del self.cache[key]  # Remove expired
+                del self.cache[key]
         return None
 
     def _cache_result(self, key: str, result: Dict):
-        """Cache the result"""
-        self.cache[key] = {
-            'result': result,
-            'timestamp': time.time()
-        }
+        """Cache result"""
+        self.cache[key] = {'result': result, 'timestamp': time.time()}
 
-    def _lightweight_detect(self, query: str) -> Tuple[str, float]:
-        """Fast keyword-based detection for common cases"""
-        query_lower = query.lower().strip()
+    # ====================================================================
+    # STAGE 1: Regex Pattern Matching
+    # ====================================================================
+    
+    def _stage1_regex_detection(self, query: str) -> Optional[Tuple[str, float]]:
+        """
+        Stage 1: Ultra-fast regex pattern matching
+        Returns: (intent, confidence) or None if no clear match
+        """
+        query_lower = query.lower()
 
-        decision_score = sum(1 for keyword in self.decision_keywords if keyword in query_lower)
-        info_score = sum(1 for keyword in self.informational_keywords if keyword in query_lower)
+        # Check decision patterns
+        for pattern in self.decision_patterns:
+            if re.search(pattern, query_lower, re.IGNORECASE):
+                return ("DECISION_MAKING", 0.95)  # Highest confidence
 
-        # Clear decision indicators
-        if any(phrase in query_lower for phrase in ['what should i do', 'how to', 'what to do', 'should i']):
-            return "DECISION_MAKING", 0.9
+        # Check informational patterns
+        for pattern in self.informational_patterns:
+            if re.search(pattern, query_lower, re.IGNORECASE):
+                return ("INFORMATIONAL", 0.95)
 
-        # Clear informational indicators
-        if query_lower.startswith(('what is', 'define', 'explain', 'what are')):
-            return "INFORMATIONAL", 0.9
+        return None  # No clear pattern match
 
-        # Score-based decision
+    # ====================================================================
+    # STAGE 2: Keyword Scoring
+    # ====================================================================
+    
+    def _stage2_keyword_scoring(self, query: str) -> Tuple[str, float]:
+        """
+        Stage 2: Keyword-based scoring
+        Returns: (intent, confidence)
+        """
+        query_lower = query.lower()
+        
+        decision_score = sum(1 for kw in self.decision_keywords if kw in query_lower)
+        info_score = sum(1 for kw in self.informational_keywords if kw in query_lower)
+
+        # Calculate confidence based on score difference
+        max_score = max(decision_score, info_score)
+        if max_score == 0:
+            return ("UNKNOWN", 0.3)  # No keywords found
+
         if decision_score > info_score:
-            confidence = min(0.8, 0.5 + (decision_score * 0.1))
-            return "DECISION_MAKING", confidence
+            # Higher decision score
+            confidence = 0.5 + (min(decision_score / 10, 0.4))
+            return ("DECISION_MAKING", confidence)
         elif info_score > decision_score:
-            confidence = min(0.8, 0.5 + (info_score * 0.1))
-            return "INFORMATIONAL", confidence
+            # Higher info score
+            confidence = 0.5 + (min(info_score / 10, 0.4))
+            return ("INFORMATIONAL", confidence)
         else:
-            return "UNKNOWN", 0.5  # Need LLM classification
+            # Equal scores
+            return ("UNKNOWN", 0.4)
 
+    # ====================================================================
+    # STAGE 3: LLM Fallback (Only for Ambiguous Cases)
+    # ====================================================================
+    
+    def _stage3_llm_classification(self, query: str) -> Tuple[str, float]:
+        """
+        Stage 3: LLM-based classification (Only when stages 1-2 are uncertain)
+        Returns: (intent, confidence)
+        """
+        try:
+            self.llm_call_count += 1
+            prompt = self.llm_prompt.format(question=query)
+            response = gemini_llm._call(prompt).strip().upper()
+
+            intent = "DECISION_MAKING" if "DECISION" in response else "INFORMATIONAL"
+            return (intent, 0.75)  # Medium confidence from LLM
+
+        except Exception as e:
+            print(f"⚠️ LLM classification failed: {e}")
+            return ("INFORMATIONAL", 0.4)  # Safe fallback
+
+    # ====================================================================
+    # MAIN: Multi-Stage Detection Pipeline
+    # ====================================================================
+    
     def detect_intent(self, query: str) -> Dict:
-        """Detect if query requires decision-making or is informational"""
-        # Check cache first
+        """
+        Multi-stage intent detection with progressive fallback
+        Minimizes LLM calls through cascading detection stages
+        """
+        self.total_queries += 1
+        
+        # Check cache
         cache_key = self._get_cache_key(query)
         cached = self._is_cached(cache_key)
         if cached:
             return cached
 
-        # Fast lightweight detection first
-        intent, confidence = self._lightweight_detect(query)
-
-        if confidence >= 0.8:
-            # High confidence from keywords, use this
-            result = {
+        # ===== STAGE 1: Regex Patterns =====
+        result = self._stage1_regex_detection(query)
+        if result:
+            intent, confidence = result
+            print(f"🔍 Intent detected via REGEX: {intent} (confidence: {confidence})")
+            output = {
                 'intent': intent,
-                'confidence': 'HIGH' if confidence >= 0.9 else 'MEDIUM',
-                'method': 'keyword',
-                'reason': f'Keyword-based detection (confidence: {confidence:.2f})'
+                'confidence': 'HIGH',
+                'method': 'regex_pattern',
+                'reason': 'Clear pattern match detected',
+                'llm_used': False
             }
-        else:
-            # Use Gemini for uncertain cases (lightweight and free)
-            try:
-                prompt = self.prompt.format(question=query)
-                response = gemini_llm._call(prompt)
+            self._cache_result(cache_key, output)
+            return output
 
-                # Parse Gemini response
-                intent = "INFORMATIONAL"  # default
-                confidence = "MEDIUM"
-                reason = "Gemini classification"
+        # ===== STAGE 2: Keyword Scoring =====
+        intent, confidence = self._stage2_keyword_scoring(query)
+        if confidence >= 0.65:  # Lower threshold to catch more queries with keyword detection
+            print(f"🔍 Intent detected via KEYWORDS: {intent} (confidence: {confidence:.2f})")
+            output = {
+                'intent': intent,
+                'confidence': 'HIGH' if confidence >= 0.8 else 'MEDIUM',
+                'method': 'keyword_scoring',
+                'reason': f'Keyword analysis (confidence: {confidence:.2f})',
+                'llm_used': False
+            }
+            self._cache_result(cache_key, output)
+            return output
 
-                for line in response.split('\n'):
-                    line = line.strip()
-                    if line.startswith('Intent:'):
-                        intent_val = line.split(':', 1)[1].strip().upper()
-                        if 'DECISION' in intent_val:
-                            intent = 'DECISION_MAKING'
-                        else:
-                            intent = 'INFORMATIONAL'
-                    elif line.startswith('Confidence:'):
-                        confidence = line.split(':', 1)[1].strip().upper()
-                    elif line.startswith('Reason:'):
-                        reason = line.split(':', 1)[1].strip()
+        # ===== STAGE 3: LLM Fallback (Only ~10-15% of queries) =====
+        print(f"🔍 Intent detection falling back to LLM for ambiguous query")
+        intent, confidence = self._stage3_llm_classification(query)
+        print(f"🤖 LLM Intent result: {intent} (confidence: {confidence})")
+        output = {
+            'intent': intent,
+            'confidence': 'MEDIUM',
+            'method': 'llm_classification',
+            'reason': 'LLM-based classification for ambiguous query',
+            'llm_used': True
+        }
+        self._cache_result(cache_key, output)
+        return output
 
-                result = {
-                    'intent': intent,
-                    'confidence': confidence,
-                    'method': 'gemini',
-                    'reason': reason
-                }
+    def get_statistics(self) -> Dict:
+        """Get detection statistics"""
+        return {
+            'total_queries': self.total_queries,
+            'llm_calls': self.llm_call_count,
+            'llm_usage_percentage': (self.llm_call_count / max(self.total_queries, 1)) * 100,
+            'cache_size': len(self.cache)
+        }
 
-            except Exception as e:
-                # Fallback to keyword detection if Gemini fails
-                result = {
-                    'intent': intent if intent != "UNKNOWN" else "INFORMATIONAL",
-                    'confidence': 'LOW',
-                    'method': 'fallback',
-                    'reason': f'Gemini error: {str(e)}'
-                }
 
-        # Cache result
-        self._cache_result(cache_key, result)
-        return result
+# Keep the old class name for backwards compatibility but use the new implementation
+class DecisionIntentDetectionAgent(OptimizedIntentDetectionAgent):
+    """Backwards compatible wrapper"""
+    pass
 
 # ------------------ Decision Making Agent ------------------
 class DecisionMakingAgent:

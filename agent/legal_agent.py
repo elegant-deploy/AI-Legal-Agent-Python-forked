@@ -658,8 +658,38 @@ Return only the classification information.""",
         )
 
     def classify(self, question: str) -> dict:
-        """Classify the query into legal domains using Gemini"""
+        """Classify the query into legal domains using keyword matching first, then LLM as fallback"""
         try:
+            question_lower = question.lower()
+
+            # Step 1: Fast keyword-based domain detection
+            matched_domains = []
+            keyword_confidence_scores = {}
+
+            for domain, keywords in DOMAIN_KEYWORDS.items():
+                matches = sum(1 for keyword in keywords if keyword in question_lower)
+                if matches > 0:
+                    matched_domains.append(domain)
+                    keyword_confidence_scores[domain] = matches / len(keywords)  # Normalized score
+
+            # Step 2: Determine confidence based on keyword matching
+            if matched_domains:
+                # Sort by confidence score
+                best_domain = max(matched_domains, key=lambda d: keyword_confidence_scores[d])
+                confidence_score = keyword_confidence_scores[best_domain]
+
+                # High confidence if we have strong keyword matches
+                if confidence_score >= 0.3 or len(matched_domains) == 1:
+                    confidence = "high" if confidence_score >= 0.5 else "medium"
+                    print(f"🔍 Keyword-based classification: {best_domain.upper()} (confidence: {confidence})")
+                    return {
+                        'primary_domain': best_domain,
+                        'confidence': confidence,
+                        'all_domains': matched_domains
+                    }
+
+            # Step 3: Fallback to LLM classification if keyword matching is uncertain
+            print("🔄 Keyword matching uncertain, using LLM classification...")
             prompt = self.prompt.format(question=question, domains=', '.join(self.domains))
             response = gemini_llm._call(prompt)
 
@@ -828,12 +858,11 @@ def get_hf_embeddings(texts, api_key, model):
 
 def get_reranker_scores_batch(inputs, api_key, model):
     """Get reranker scores from Hugging Face Inference API with fallback models"""
-    # Try multiple reranker models in order of preference
+    # Try multiple reranker models in order of preference (prioritizing speed)
     models_to_try = [
-        model,  # Original model from settings
-        "BAAI/bge-reranker-large",  # Alternative large model
-        "BAAI/bge-reranker-base",   # Base model
-        "cross-encoder/ms-marco-MiniLM-L-6-v2"  # Fallback cross-encoder
+        model,  # Primary model from settings (now TinyBERT - fast and lightweight)
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",  # MiniLM fallback (still lightweight)
+        "BAAI/bge-reranker-base"   # BGE base as final fallback
     ]
 
     for current_model in models_to_try:
@@ -865,29 +894,40 @@ def get_reranker_scores_batch(inputs, api_key, model):
     raise Exception(f"All reranker models failed. Last error: {str(e) if 'e' in locals() else 'Unknown error'}")
 
 def rerank_with_bge(question, docs):
-    """Rerank documents using BGE reranker with error handling and fallback"""
+    """Rerank documents using lightweight reranker with optimized performance"""
     if len(docs) <= 3:
         # For small result sets, skip reranking to avoid API calls
-        print(f"📊 Small result set ({len(docs)} docs), skipping BGE reranking")
+        print(f"📊 Small result set ({len(docs)} docs), skipping reranking")
         return docs
+
+    # Limit reranking to configured maximum for speed
+    max_docs_to_rerank = min(len(docs), settings.MAX_RERANK_DOCS)
+    docs_to_rerank = docs[:max_docs_to_rerank]
 
     try:
         inputs = []
-        for doc in docs:
-            text = f"[QUERY]\n{question}\n\n[DOC]\n{doc.page_content}\n\nReturn a single numeric relevance score between 0 and 1."
+        for doc in docs_to_rerank:
+            # Use simpler input format for lightweight models
+            text = f"{question} [SEP] {doc.page_content[:500]}"  # Limit content length for speed
             inputs.append(text)
 
-        print(f"🧮 Computing reranker scores for {len(inputs)} doc pairs...")
+        print(f"🧮 Computing reranker scores for {len(inputs)} doc pairs (limited to {max_docs_to_rerank} for speed)...")
         scores = get_reranker_scores_batch(inputs, settings.HF_API_KEY, settings.HF_RERANKER_MODEL)
 
         # Sort docs by scores descending
-        doc_score_pairs = list(zip(docs, scores))
+        doc_score_pairs = list(zip(docs_to_rerank, scores))
         doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-        print(f"✅ BGE reranking completed successfully")
-        return [doc for doc, score in doc_score_pairs]
+
+        # Return reranked docs plus any remaining docs in original order
+        reranked_docs = [doc for doc, score in doc_score_pairs]
+        if len(docs) > max_docs_to_rerank:
+            reranked_docs.extend(docs[max_docs_to_rerank:])
+
+        print(f"✅ Lightweight reranking completed successfully")
+        return reranked_docs
 
     except Exception as e:
-        print(f"⚠️ BGE reranker failed: {type(e).__name__}: {str(e)}")
+        print(f"⚠️ Lightweight reranker failed: {type(e).__name__}: {str(e)}")
         print(f"📊 Falling back to keyword-based reranking")
         # Fallback to simple keyword-based reranking
         return _fallback_keyword_rerank(question, docs)
@@ -1248,7 +1288,7 @@ class SmartLegalAssistant:
         print("⚖️ Using Traditional RAG Flow...")
 
         # Step 1: Query Classification using Gemini
-        print("🧠 Classifying query domain using Gemini...")
+        # print("🧠 Classifying query domain using Gemini...")
         classification = self.classification_agent.classify(question)
         domain = classification['primary_domain']
         all_domains = classification['all_domains']

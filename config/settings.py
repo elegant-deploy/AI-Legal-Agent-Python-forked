@@ -19,7 +19,7 @@ class Settings:
         self.CHROMA_DATABASE = os.getenv('CHROMA_DATABASE')
 
         # LLM MODEL - Try different free models to avoid rate limits
-        self.OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'deepseek/deepseek-r1-0528-qwen3-8b:free')
+        self.OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-7b-instruct:free')
 
         # Gemini API for lightweight tasks
         self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC3I937nk4tfVXZRkeBI48QZY-qheWUj2g')
@@ -37,10 +37,11 @@ class Settings:
         # Hugging Face Embeddings and Reranker Config
         self.HF_API_KEY = os.getenv('HF_API_KEY')
         self.HF_EMBED_MODEL = os.getenv('HF_EMBED_MODEL', 'BAAI/bge-m3')
-        self.HF_RERANKER_MODEL = os.getenv('HF_RERANKER_MODEL', 'BAAI/bge-reranker-v2-m3')
+        self.HF_RERANKER_MODEL = os.getenv('HF_RERANKER_MODEL', 'cross-encoder/ms-marco-TinyBERT-L-2-v2')
         self.EMBED_BATCH_SIZE = int(os.getenv('EMBED_BATCH_SIZE', 64))
         self.TOP_K = int(os.getenv('TOP_K', 50))
         self.RERANK_N = int(os.getenv('RERANK_N', 20))
+        self.MAX_RERANK_DOCS = int(os.getenv('MAX_RERANK_DOCS', 15))  # Limit docs for reranking speed
 
 
     def setup_environment(self):

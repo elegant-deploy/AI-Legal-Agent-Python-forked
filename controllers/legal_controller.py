@@ -19,6 +19,7 @@ async def ask_legal_question(question: str, context=None):
         # Detect intent - this is cached and very fast (< 0.1s for cached results)
         # For repeated queries, this will be instant due to caching
         intent_result = intent_detector.detect_intent(question)
+        print(f"🎯 Intent Detection Result: {intent_result['intent']} via {intent_result['method']} (LLM used: {intent_result.get('llm_used', False)})")
 
         # Step 2: Route based on intent
         if intent_result['intent'] == 'DECISION_MAKING':
