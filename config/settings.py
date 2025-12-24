@@ -22,8 +22,14 @@ class Settings:
         self.OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-7b-instruct:free')
 
         # Gemini API for lightweight tasks
-        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyC3I937nk4tfVXZRkeBI48QZY-qheWUj2g')
+        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyBvp8WKlFMu_oB-NGmskIdVctdVhgkkLU4')
         self.DEVELOPMENT_MODEL = os.getenv('DEVELOPMENT_MODEL', 'gemini-2.0-flash')
+
+        # XAI API Key
+        self.XAI_API_KEY = os.getenv('XAI_API_KEY')
+        # Deepseek API Key
+        self.DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+
 
         
         #AWS s3

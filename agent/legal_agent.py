@@ -16,6 +16,7 @@ import hashlib
 from functools import lru_cache
 from tenacity import retry, stop_after_attempt, wait_exponential
 import time
+from transformers import pipeline
 
 # ------------------ OpenRouter Config ------------------
 OPENROUTER_API_URL = settings.OPENROUTER_API_URL
@@ -530,6 +531,18 @@ def get_collection_retriever(collection_name: str, k: int = 4):
 class QueryReformulationAgent:
     def __init__(self, llm):
         self.llm = llm
+        # Initialize T5-small for fast, free reformulation
+        try:
+            self.t5_reformulator = pipeline(
+                "text2text-generation",
+                model="google/flan-t5-small",
+                device=-1  # Use CPU for compatibility, can be changed to 0 for GPU
+            )
+            print("T5-small reformulator loaded successfully")
+        except Exception as e:
+            print(f"Warning: Failed to load T5-small: {e}. Falling back to LLM.")
+            self.t5_reformulator = None
+
         self.prompt = PromptTemplate(
             template="""You are a query reformulation expert for legal questions. Your task is to:
 
@@ -550,7 +563,302 @@ Return only the reformulated queries, one per line.""",
         )
 
     def reformulate(self, question: str) -> List[str]:
-        """Enhanced query reformulation for legal search using Gemini"""
+        """Rule-based legal query reformulation with intelligent legal-specific logic"""
+        try:
+            print("Reformulating query using rule-based legal logic...")
+            start_time = time.time()
+
+            # Analyze legal context
+            legal_context = self._analyze_legal_context(question)
+
+            # Generate rule-based variants
+            variants = self._generate_rule_based_variants(question, legal_context)
+
+            # Ensure original question is included
+            if question not in variants:
+                variants.insert(0, question)
+
+            # Fill up to 3 variants if needed
+            while len(variants) < 3:
+                additional = self._create_additional_variant(question, legal_context, len(variants))
+                if additional and additional not in variants:
+                    variants.append(additional)
+
+            # Clean and deduplicate
+            final_variants = []
+            seen = set()
+            for variant in variants[:3]:
+                clean_variant = variant.strip()
+                if clean_variant and clean_variant not in seen and len(clean_variant) > 8:
+                    seen.add(clean_variant)
+                    final_variants.append(clean_variant)
+
+            elapsed = time.time() - start_time
+            print(f"Rule-based reformulation completed in {elapsed:.2f}s")
+            return final_variants[:3]
+
+        except Exception as e:
+            print(f"Rule-based reformulation failed: {e}, falling back to LLM...")
+            return self._llm_reformulate_fallback(question)
+
+    def _analyze_legal_context(self, question: str) -> dict:
+        """Analyze the legal context of a query"""
+        query_lower = question.lower()
+
+        # Detect legal domains
+        domains = []
+        for domain, keywords in DOMAIN_KEYWORDS.items():
+            if any(keyword in query_lower for keyword in keywords):
+                domains.append(domain)
+
+        # Extract section numbers
+        import re
+        section_matches = re.findall(r'section\s+(\d+)', query_lower, re.IGNORECASE)
+        sections = [int(match) for match in section_matches]
+
+        # Check for specific legal terms
+        legal_indicators = ['law', 'act', 'ordinance', 'code', 'court', 'provision', 'section', 'article']
+
+        return {
+            'domains': domains,
+            'sections': sections,
+            'has_legal_terms': any(term in query_lower for term in legal_indicators),
+            'is_question': question.strip().endswith('?'),
+            'word_count': len(question.split())
+        }
+
+    def _create_legal_reformulation_prompts(self, question: str, context: dict) -> List[str]:
+        """Create targeted prompts for legal reformulation"""
+        prompts = []
+
+        # Base reformulation prompt
+        prompts.append(f"Rewrite this legal question in different words: {question}")
+
+        # Domain-specific prompts
+        if context['domains']:
+            primary_domain = context['domains'][0]
+            prompts.append(f"Rephrase this {primary_domain} law question: {question}")
+            prompts.append(f"Ask this differently about {primary_domain} legal matters: {question}")
+
+        # Section-specific prompts
+        if context['sections']:
+            section_num = context['sections'][0]
+            prompts.append(f"Rephrase question about section {section_num}: {question}")
+            prompts.append(f"Ask differently about legal section {section_num}: {question}")
+
+        # General legal prompts
+        if context['has_legal_terms']:
+            prompts.append(f"Paraphrase this legal query: {question}")
+            prompts.append(f"Express this legal question differently: {question}")
+
+        return prompts[:3]  # Limit to 3 prompts for efficiency
+
+    def _is_valid_reformulation(self, text: str, original: str) -> bool:
+        """Check if a reformulation is valid and useful"""
+        if not text or len(text.strip()) < 5:
+            return False
+
+        text_lower = text.lower()
+        original_lower = original.lower()
+
+        # Reject if too similar to original (less than 30% different)
+        if len(set(text_lower.split()) - set(original_lower.split())) < 0.3 * len(set(original_lower.split())):
+            return False
+
+        # Reject nonsensical or too short responses
+        if len(text.split()) < 3:
+            return False
+
+        # Reject if it starts with strange prefixes
+        bad_prefixes = ['t.', 't.i.', 'legal law', 'law legal', 'the the', 'a a', 'an an']
+        if any(text_lower.startswith(prefix) for prefix in bad_prefixes):
+            return False
+
+        # Reject if it contains too many repeated words
+        words = text_lower.split()
+        if len(words) > len(set(words)) * 2:  # More than 50% duplicates
+            return False
+
+        return True
+
+    def _post_process_variants(self, variants: List[str], original: str, context: dict) -> List[str]:
+        """Post-process and rank the generated variants"""
+        valid_variants = []
+
+        for variant in variants:
+            if self._is_valid_reformulation(variant, original):
+                # Score the variant
+                score = self._score_variant(variant, original, context)
+                valid_variants.append((variant, score))
+
+        # Sort by score and return top variants
+        valid_variants.sort(key=lambda x: x[1], reverse=True)
+        return [variant for variant, score in valid_variants]
+
+    def _score_variant(self, variant: str, original: str, context: dict) -> float:
+        """Score a variant based on quality criteria"""
+        score = 0.0
+        variant_lower = variant.lower()
+
+        # Prefer variants that maintain legal terminology
+        legal_terms = ['law', 'act', 'section', 'provision', 'court', 'legal', 'ordinance', 'code']
+        legal_term_count = sum(1 for term in legal_terms if term in variant_lower)
+        score += legal_term_count * 0.5
+
+        # Prefer variants that include domain-specific terms
+        if context['domains']:
+            domain_matches = sum(1 for domain in context['domains'] if domain in variant_lower)
+            score += domain_matches * 0.8
+
+        # Prefer variants that keep section numbers
+        if context['sections']:
+            section_matches = sum(1 for section in context['sections']
+                                if f"section {section}" in variant_lower or f"section{section}" in variant_lower)
+            score += section_matches * 1.0
+
+        # Prefer variants that are properly formed questions
+        if variant.strip().endswith('?'):
+            score += 0.3
+
+        # Length appropriateness (not too short, not too long)
+        word_count = len(variant.split())
+        if 4 <= word_count <= 15:
+            score += 0.2
+        elif word_count > 20:
+            score -= 0.3
+
+        # Diversity from original
+        original_words = set(original.lower().split())
+        variant_words = set(variant_lower.split())
+        overlap_ratio = len(original_words & variant_words) / len(original_words) if original_words else 0
+        if 0.3 <= overlap_ratio <= 0.8:  # Good balance of similarity and difference
+            score += 0.4
+
+        return score
+
+    def _generate_rule_based_variants(self, question: str, context: dict) -> List[str]:
+        """Generate rule-based legal query variants"""
+        variants = []
+        question_lower = question.lower()
+
+        # Pattern 1: Section-based queries
+        if context['sections']:
+            section_num = context['sections'][0]
+            variants.extend([
+                f"What are the provisions of section {section_num}?",
+                f"Section {section_num} legal requirements",
+                f"Explain section {section_num} of the law"
+            ])
+
+        # Pattern 2: Domain-specific reformulations
+        elif context['domains']:
+            domain = context['domains'][0]
+
+            # Family law patterns
+            if domain == 'family':
+                if 'nikah' in question_lower or 'marriage' in question_lower:
+                    variants.extend([
+                        "What are the requirements for marriage in Pakistan?",
+                        "Marriage requirements under Pakistani family law",
+                        "Conditions for valid nikah in Pakistan"
+                    ])
+                elif 'divorce' in question_lower:
+                    variants.extend([
+                        "Divorce procedure in Pakistan",
+                        "How to get divorce under Pakistani law",
+                        "Talaq requirements in Pakistan"
+                    ])
+                else:
+                    variants.extend([
+                        f"Family law provisions for {question}",
+                        f"Pakistani family law requirements",
+                        f"Family court procedures in Pakistan"
+                    ])
+
+            # Corporate law patterns
+            elif domain == 'corporate':
+                if 'pension' in question_lower or 'eobi' in question_lower:
+                    variants.extend([
+                        "EOBI pension increase notification",
+                        "Revision of EOBI pension amount under labor laws",
+                        "EOBI minimum pension rates in Pakistan"
+                    ])
+                elif 'employee' in question_lower or 'rights' in question_lower:
+                    variants.extend([
+                        "Employee rights under Pakistani labor law",
+                        "Workers rights and protections in Pakistan",
+                        "Employment law provisions for employees"
+                    ])
+                else:
+                    variants.extend([
+                        f"Corporate law requirements for {question}",
+                        f"Company law provisions in Pakistan",
+                        f"Business registration requirements"
+                    ])
+
+            # Criminal law patterns
+            elif domain == 'ppc':
+                variants.extend([
+                    f"Criminal law provisions for {question}",
+                    f"PPC sections related to {question}",
+                    f"Pakistani penal code requirements"
+                ])
+
+            # Traffic law patterns
+            elif domain == 'traffic':
+                variants.extend([
+                    f"Traffic law violations and penalties",
+                    f"Road traffic rules in Pakistan",
+                    f"Traffic fines and regulations"
+                ])
+
+        # Pattern 3: General legal queries
+        else:
+            # Requirements-based questions
+            if 'requirements' in question_lower or 'conditions' in question_lower:
+                variants.extend([
+                    f"Legal requirements for {question.replace('requirements', '').replace('conditions', '').strip()}",
+                    f"Pakistani law provisions regarding {question}",
+                    f"Legal procedure and requirements"
+                ])
+
+            # How-to questions
+            elif question_lower.startswith(('how', 'what is the process', 'what are the steps')):
+                variants.extend([
+                    f"Legal procedure for {question}",
+                    f"Steps required under Pakistani law",
+                    f"Legal requirements and process"
+                ])
+
+            # General legal questions
+            else:
+                variants.extend([
+                    f"Pakistani legal provisions for {question}",
+                    f"Law and regulations regarding {question}",
+                    f"Legal requirements in Pakistan"
+                ])
+
+        return variants
+
+    def _create_additional_variant(self, question: str, context: dict, index: int) -> str:
+        """Create additional variants when rule-based generation doesn't provide enough"""
+        question_lower = question.lower()
+
+        if index == 1:
+            # Focus on Pakistani context
+            return f"Pakistan law regarding {question}"
+
+        elif index == 2:
+            # Focus on legal procedures
+            if 'section' in question_lower:
+                return f"Legal interpretation of {question}"
+            else:
+                return f"Legal provisions and requirements for {question}"
+
+        return None
+
+    def _llm_reformulate_fallback(self, question: str) -> List[str]:
+        """Fallback LLM-based reformulation when T5 fails"""
         try:
             # Enhanced prompt for better legal query generation
             enhanced_prompt = f"""You are an expert legal query reformulation specialist. Your task is to create multiple precise search queries that will effectively retrieve legal information from document databases.
@@ -1255,30 +1563,48 @@ class SmartLegalAssistant:
 
         # Check if decision-making is enabled and use LangGraph flow
         if self.decision_enabled and self.decision_flow:
-            print("⚖️ Using Decision-Making Flow...")
+            print("Using Decision-Making Flow...")
             try:
-                decision_result = await self.decision_flow.process_query(question)
+                # First, get basic legal context for decision-making
+                basic_context = await self._get_basic_legal_context(question)
 
-                if decision_result['success']:
-                    # Return formatted response
+                decision_result = await self.decision_flow.process_query(question, legal_context=basic_context)
+
+                if decision_result.get('response_type') == 'decision_making' and decision_result.get('decision_advice'):
+                    # Format the decision-making response
+                    formatted_response = f"""# 🤖 **Legal Decision-Making Assistant**
+
+## 📋 **Query Analysis**
+**Intent Detected:** {decision_result.get('intent_analysis', {}).get('intent', 'DECISION_MAKING')}
+**Confidence:** {decision_result.get('intent_analysis', {}).get('confidence', 'HIGH')}
+**Method:** {decision_result.get('intent_analysis', {}).get('method', 'structured_decision_making')}
+
+## 💡 **Decision-Making Advice**
+
+{decision_result.get('decision_advice', 'Unable to generate decision-making advice at this time.')}
+
+---
+**Processing Details:** Context used: {decision_result.get('context_used', 0)} documents | Method: {decision_result.get('method', 'structured_decision_making')}
+"""
+
                     result = {
-                        "result": decision_result['response'],
-                        "source_documents": [],  # Will be populated by the flow if needed
+                        "result": formatted_response,
+                        "source_documents": basic_context,  # Include the context used
                         "searched_collections": [],
                         "detected_domain": "decision_making",
                         "reformulated_queries": [],
                         "query_id": query_id,
-                        "intent_analysis": decision_result.get('intent', {}),
-                        "processing_path": decision_result.get('processing_path', 'unknown')
+                        "intent_analysis": decision_result.get('intent_analysis', {}),
+                        "processing_path": decision_result.get('path_taken', 'decision_making')
                     }
 
                     # Track token usage asynchronously
-                    asyncio.create_task(track_token_usage_async(query_id, question, decision_result['response']))
+                    asyncio.create_task(track_token_usage_async(query_id, question, formatted_response))
 
                     print("Decision-making response generated successfully!")
                     return result
                 else:
-                    print(f"Decision flow failed: {decision_result.get('error', 'Unknown error')}")
+                    print(f"Decision flow did not return valid advice: {decision_result}")
                     # Fall back to traditional RAG
             except Exception as e:
                 print(f"Decision flow error: {e}")
@@ -1442,6 +1768,25 @@ class SmartLegalAssistant:
         except RuntimeError:
             # No event loop, create one
             return asyncio.run(self.__call_async(question, conversation_history))
+
+    async def _get_basic_legal_context(self, question: str) -> List:
+        """Get basic legal context for decision-making before full RAG"""
+        try:
+            # Quick domain detection
+            domain, collections_to_search = detect_query_domain(question)
+
+            if not collections_to_search:
+                return []
+
+            # Get a few documents quickly for context
+            reformulated_queries = self.reformulation_agent.reformulate(question)
+            basic_docs = await self.search_collections_async(reformulated_queries[:2], collections_to_search, k_per_collection=2)
+
+            return basic_docs[:5]  # Limit to 5 docs for decision-making
+
+        except Exception as e:
+            print(f"Warning: Could not get basic legal context: {e}")
+            return []
 
     def _sync_call(self, question: str, conversation_history: Optional[List[dict]] = None):
         """Synchronous fallback method"""
