@@ -11,7 +11,7 @@ class Settings:
 
         # API Keys
         self.OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-        self.OPENROUTER_API_URL = os.getenv('OPENROUTER_API_URL')
+        self.OPENROUTER_API_URL = os.getenv('OPENROUTER_API_URL', 'https://openrouter.ai/api/v1')
 
         # ChromaDB Config
         self.CHROMA_API_KEY = os.getenv('CHROMA_API_KEY')
@@ -22,13 +22,15 @@ class Settings:
         self.OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-7b-instruct:free')
 
         # Gemini API for lightweight tasks
-        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyBvp8WKlFMu_oB-NGmskIdVctdVhgkkLU4')
-        self.DEVELOPMENT_MODEL = os.getenv('DEVELOPMENT_MODEL', 'gemini-2.0-flash')
+        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+        self.DEVELOPMENT_MODEL = os.getenv('DEVELOPMENT_MODEL', 'gemini-2.0-flash-exp')
 
         # XAI API Key
         self.XAI_API_KEY = os.getenv('XAI_API_KEY')
         # Deepseek API Key
         self.DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+        #  perplexity API Key
+        self.PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
 
 
         

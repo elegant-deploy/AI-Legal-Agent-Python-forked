@@ -9,7 +9,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.language_models import LLM
 from langchain_core.documents import Document
 from config.settings import settings
-from agent.gemini_llm import gemini_llm
+from agent.gemini_llm import perplexity_llm
 
 # ============================================================================
 # OPTIMIZED MULTI-STAGE INTENT DETECTION (Minimal LLM calls)
@@ -214,7 +214,7 @@ Only respond with one word: INFORMATIONAL or DECISION""",
         try:
             self.llm_call_count += 1
             prompt = self.llm_prompt.format(question=query)
-            response = gemini_llm._call(prompt).strip().upper()
+            response = perplexity_llm._call(prompt).strip().upper()
 
             intent = "DECISION_MAKING" if "DECISION" in response else "INFORMATIONAL"
             return (intent, 0.75)  # Medium confidence from LLM

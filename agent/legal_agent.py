@@ -5,18 +5,21 @@ import uuid
 import json
 from langchain_core.prompts import PromptTemplate
 from langchain_core.language_models import LLM
+from langchain_core.outputs import LLMResult
 from typing import Optional, List, Tuple
 from config.settings import settings
 from helper.token_tracker import track_token_usage_async
 from rank_bm25 import BM25Okapi
-from agent.gemini_llm import gemini_llm
+from agent.gemini_llm import gemini_llm, perplexity_llm
 import numpy as np
 import asyncio
 import hashlib
 from functools import lru_cache
 from tenacity import retry, stop_after_attempt, wait_exponential
 import time
+import openai
 from transformers import pipeline
+from config.settings import settings
 
 # ------------------ OpenRouter Config ------------------
 OPENROUTER_API_URL = settings.OPENROUTER_API_URL
@@ -78,6 +81,7 @@ class OpenRouterLLM(LLM):
     request_times: list = []  # Track request timestamps for rate limiting
     max_requests_per_minute: int = 10  # Conservative limit for free tier
     retry_delays: list = [1, 2, 4, 8, 16]  # Exponential backoff in seconds
+    max_retries: int = 3
 
     @property
     def _llm_type(self) -> str:
@@ -101,6 +105,49 @@ class OpenRouterLLM(LLM):
         # Record this request
         self.request_times.append(current_time)
 
+    def _call_with_retry(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        """Call OpenRouter with retry logic"""
+        for attempt in range(self.max_retries):
+            try:
+                print(f"🔴 Calling OpenRouter API (attempt {attempt + 1}/{self.max_retries})...")
+
+                # Enforce rate limiting
+                self._enforce_rate_limit()
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"
+                }
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 2000
+                }
+
+                resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
+
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get('retry-after')
+                    wait_time = int(retry_after) if retry_after else 5
+                    print(f"Rate limited (429). Waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                print(f"OpenRouter API call successful on attempt {attempt + 1}")
+                return data["choices"][0]["message"]["content"]
+
+            except Exception as e:
+                print(f"OpenRouter API error on attempt {attempt + 1}: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delays[attempt])
+                    continue
+                return f"[OpenRouter Error] Failed after {self.max_retries} attempts: {e}"
+
+        return "[OpenRouter Error] Max retries exceeded"
+
     def _call_with_fallback(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         """Call Gemini first (3 attempts), then fallback to OpenRouter"""
         from agent.gemini_llm import gemini_llm
@@ -116,45 +163,58 @@ class OpenRouterLLM(LLM):
 
         print("⚠️ Gemini failed, falling back to OpenRouter...")
 
-        # Fallback to OpenRouter (1 attempt with rate limiting)
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 2000
-        }
-
-        try:
-            # Enforce rate limiting
-            self._enforce_rate_limit()
-
-            print("🔴 Calling OpenRouter API (fallback attempt)...")
-            resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
-
-            if resp.status_code == 429:
-                retry_after = resp.headers.get('retry-after')
-                wait_time = int(retry_after) if retry_after else 5
-                print(f"Rate limited (429). Waiting {wait_time} seconds...")
-                time.sleep(wait_time)
-                # One more try after waiting
-                resp = requests.post(self.api_url, headers=headers, json=payload, timeout=30)
-
-            resp.raise_for_status()
-            data = resp.json()
-            print("✅ OpenRouter fallback successful")
-            return data["choices"][0]["message"]["content"]
-
-        except Exception as e:
-            print(f"❌ Both Gemini and OpenRouter failed: {e}")
-            return f"[API Error] Both primary and fallback LLM services failed. Please try again later. Error: {e}"
+        # Fallback to OpenRouter
+        return self._call_with_retry(prompt, stop)
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         """Main call method with Gemini-first, OpenRouter-fallback strategy"""
         return self._call_with_fallback(prompt, stop)
+
+# ------------------ Custom OpenRouter LLM wrapper ------------------
+
+# Create singleton instance
+openrouter_llm = OpenRouterLLM()
+
+# ------------------ Primary LLM with Perplexity first, OpenRouter fallback ------------------
+class PrimaryLLM(LLM):
+    @property
+    def _llm_type(self) -> str:
+        return "primary"
+
+    def _call_with_fallback(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        """Call Gemini first, then fallback to Perplexity, then OpenRouter"""
+        # Try Gemini first (3 attempts)
+        print("🤖 Generating legal response...")
+        gemini_response = gemini_llm._call_with_retry(prompt, stop)
+        if not gemini_response.startswith("[Gemini Error]"):
+            print("✅ Gemini call successful")
+            return gemini_response
+
+        print("⚠️ Gemini failed, falling back to Perplexity...")
+
+        # Fallback to Perplexity
+        perplexity_response = perplexity_llm._call_with_retry(prompt, stop)
+        if not perplexity_response.startswith("[Perplexity Error]"):
+            print("✅ Perplexity fallback successful")
+            return perplexity_response
+
+        print("⚠️ Perplexity failed, falling back to OpenRouter...")
+
+        # Fallback to OpenRouter
+        openrouter_response = openrouter_llm._call_with_retry(prompt, stop)
+        if not openrouter_response.startswith("[OpenRouter Error]"):
+            print("✅ OpenRouter fallback successful")
+            return openrouter_response
+
+        print("❌ All LLMs failed")
+        return "[All LLMs Error] Gemini, Perplexity, and OpenRouter all failed"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        """Main call method with Gemini-first, Perplexity-fallback, OpenRouter-last strategy"""
+        return self._call_with_fallback(prompt, stop)
+
+# Create singleton instance
+primary_llm = PrimaryLLM()
 
 # ------------------ Chroma Setup ------------------
 def create_chroma_client():
@@ -563,9 +623,9 @@ Return only the reformulated queries, one per line.""",
         )
 
     def reformulate(self, question: str) -> List[str]:
-        """Rule-based legal query reformulation with intelligent legal-specific logic"""
+        """Generate 2 reformulated query variants"""
         try:
-            print("Reformulating query using rule-based legal logic...")
+            print("Generating 2 query variants...")
             start_time = time.time()
 
             # Analyze legal context
@@ -578,28 +638,31 @@ Return only the reformulated queries, one per line.""",
             if question not in variants:
                 variants.insert(0, question)
 
-            # Fill up to 3 variants if needed
-            while len(variants) < 3:
-                additional = self._create_additional_variant(question, legal_context, len(variants))
-                if additional and additional not in variants:
-                    variants.append(additional)
-
-            # Clean and deduplicate
+            # Clean and deduplicate - limit to 2 variants total
             final_variants = []
             seen = set()
-            for variant in variants[:3]:
+            for variant in variants[:3]:  # Generate up to 3, then limit to 2
                 clean_variant = variant.strip()
                 if clean_variant and clean_variant not in seen and len(clean_variant) > 8:
                     seen.add(clean_variant)
                     final_variants.append(clean_variant)
 
+            # Ensure we have at least 2 variants
+            result = final_variants[:2]
+            if len(result) < 2:
+                # If we don't have enough variants, add a simple one
+                if question not in result:
+                    result.insert(0, question)
+                if len(result) < 2:
+                    result.append(f"Legal information about {question}")
+
             elapsed = time.time() - start_time
-            print(f"Rule-based reformulation completed in {elapsed:.2f}s")
-            return final_variants[:3]
+            print(f"Generated {len(result)} variants in {elapsed:.2f}s")
+            return result[:2]
 
         except Exception as e:
-            print(f"Rule-based reformulation failed: {e}, falling back to LLM...")
-            return self._llm_reformulate_fallback(question)
+            print(f"Reformulation failed: {e}, using original question")
+            return [question, f"Legal information about {question}"]
 
     def _analyze_legal_context(self, question: str) -> dict:
         """Analyze the legal context of a query"""
@@ -886,7 +949,7 @@ For "What is section 5 of family law?":
 Return only the reformulated queries, one per line starting with "- Query X:".
 """
 
-            response = gemini_llm._call(enhanced_prompt)
+            response = self.llm._call(enhanced_prompt)
 
             # Parse the response to extract queries
             queries = []
@@ -999,7 +1062,7 @@ Return only the classification information.""",
             # Step 3: Fallback to LLM classification if keyword matching is uncertain
             print("🔄 Keyword matching uncertain, using LLM classification...")
             prompt = self.prompt.format(question=question, domains=', '.join(self.domains))
-            response = gemini_llm._call(prompt)
+            response = self.llm._call(prompt)
 
             # Parse response
             primary_domain = "general"
@@ -1073,7 +1136,7 @@ class RerankingAgent:
                 documents='\n'.join(doc_summaries)
             )
 
-            response = gemini_llm._call(prompt)
+            response = self.llm._call(prompt)
 
             # Parse rankings (simplified - in production, use more robust parsing)
             ranked_indices = []
@@ -1271,7 +1334,7 @@ def _fallback_keyword_rerank(question, docs):
 # ------------------ Smart Multi-Agent Legal Assistant ------------------
 class SmartLegalAssistant:
     def __init__(self):
-        self.llm = OpenRouterLLM()
+        self.llm = primary_llm
         self.reformulation_agent = QueryReformulationAgent(self.llm)
         self.classification_agent = QueryClassificationAgent(self.llm)
         self.reranking_agent = RerankingAgent(self.llm)
@@ -1466,7 +1529,7 @@ class SmartLegalAssistant:
 """
 
         try:
-            response = gemini_llm._call(knowledge_prompt)
+            response = self.llm._call(knowledge_prompt)
             # Add subtle note that comprehensive legal knowledge was used
             enhanced_response = response + "\n\n---\n*This comprehensive legal information is provided for educational purposes. For your specific situation, please consult the original legal texts or a qualified legal professional.*"
             return enhanced_response

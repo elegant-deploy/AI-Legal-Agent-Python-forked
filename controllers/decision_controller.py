@@ -1,9 +1,9 @@
 import asyncio
 from agent.langgraph_flow import LegalDecisionFlow
-from agent.legal_agent import OpenRouterLLM
+from agent.legal_agent import primary_llm
 
 # Initialize the decision flow
-llm = OpenRouterLLM()
+llm = primary_llm
 decision_flow = LegalDecisionFlow(llm)
 
 async def process_decision_query(question: str, context=None):

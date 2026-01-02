@@ -10,10 +10,10 @@ async def ask_legal_question(question: str, context=None):
     try:
         # Step 1: Fast intent detection (cached, lightweight)
         from agent.decision_agents import DecisionIntentDetectionAgent
-        from agent.legal_agent import OpenRouterLLM
+        from agent.legal_agent import primary_llm
 
         # Create a lightweight intent detector for fast classification
-        llm = OpenRouterLLM()
+        llm = primary_llm
         intent_detector = DecisionIntentDetectionAgent(llm)
 
         # Detect intent - this is cached and very fast (< 0.1s for cached results)
