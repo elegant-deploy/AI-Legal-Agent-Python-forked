@@ -22,7 +22,7 @@ class Settings:
         self.OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-7b-instruct:free')
 
         # Gemini API for lightweight tasks
-        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+        self.GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyCbjj8PfMbDqeco4GTZCbD2ACQwsZLsZbk')
         self.DEVELOPMENT_MODEL = os.getenv('DEVELOPMENT_MODEL', 'gemini-2.0-flash-exp')
 
         # XAI API Key

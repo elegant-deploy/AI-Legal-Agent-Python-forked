@@ -1715,9 +1715,10 @@ class SmartLegalAssistant:
             return cached_result
 
         # Step 2: Query Reformulation using Gemini
-        print("🔄 Reformulating query")
-        reformulated_queries = self.reformulation_agent.reformulate(question)
-        print(f"📝 Generated {len(reformulated_queries)} query variants")
+        # print("🔄 Reformulating query")
+        # reformulated_queries = self.reformulation_agent.reformulate(question)
+        reformulated_queries = [question]  # Skip reformulation for now
+        # print(f"📝 Generated {len(reformulated_queries)} query variants")
 
         # Step 3: Parallel Multi-Query Search with enhanced retrieval
         print("🔍 Performing enhanced hybrid search across collections...")
@@ -1842,7 +1843,8 @@ class SmartLegalAssistant:
                 return []
 
             # Get a few documents quickly for context
-            reformulated_queries = self.reformulation_agent.reformulate(question)
+            # reformulated_queries = self.reformulation_agent.reformulate(question)
+            reformulated_queries = [question]  # Skip reformulation for now
             basic_docs = await self.search_collections_async(reformulated_queries[:2], collections_to_search, k_per_collection=2)
 
             return basic_docs[:5]  # Limit to 5 docs for decision-making
