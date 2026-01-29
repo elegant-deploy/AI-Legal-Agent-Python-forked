@@ -327,18 +327,21 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                     results = self.collection.query(
                         query_embeddings=[query_emb],
                         n_results=self.k,
-                        include=["documents", "metadatas"],
+                        include=["documents", "metadatas", "distances"],
                     )
                 except Exception as e:
                     print(f"Vector search failed for {self.collection_name}: {e}")
                     return []
                 documents = []
                 if results.get("documents") and results["documents"][0]:
-                    for doc_text, metadata, doc_id in zip(
+                    distances = results.get("distances", [[]])
+                    dist_list = distances[0] if distances else []
+                    for i, (doc_text, metadata, doc_id) in enumerate(zip(
                         results["documents"][0],
                         results["metadatas"][0],
                         results["ids"][0],
-                    ):
+                    )):
+                        dist = dist_list[i] if i < len(dist_list) else float("inf")
                         documents.append(
                             Document(
                                 page_content=doc_text,
@@ -346,6 +349,7 @@ def get_collection_retriever(collection_name: str, k: int = 4):
                                     **(metadata or {}),
                                     "doc_id": doc_id,
                                     "collection_name": self.collection_name,
+                                    "chroma_distance": dist,
                                 },
                             )
                         )
@@ -1242,7 +1246,10 @@ class SmartLegalAssistant:
             if result:
                 all_docs.extend(result)
 
-        # Remove duplicates based on content similarity
+        # Sort by relevance (lower Chroma distance = more relevant), then dedupe so best-ranked copy of each chunk is kept first
+        all_docs.sort(key=lambda d: d.metadata.get("chroma_distance", float("inf")))
+
+        # Remove duplicates based on content similarity (keeps first = best distance)
         unique_docs = self._deduplicate_documents(all_docs)
         if start_time is not None:
             print(f"[{time.perf_counter()-t0:.2f}s] 🔍 Chroma done: {len(unique_docs)} unique docs from {len(queries)} query(s)")
@@ -1361,9 +1368,10 @@ class SmartLegalAssistant:
         # Traditional RAG flow (fallback or when decision-making disabled)
         print("⚖️ Using Traditional RAG Flow...")
 
-        # Step 1: Domain detection (keyword-only, no LLM)
-        domain, collections_to_search = detect_query_domain(question)
-        print(f"🎯 Domain: {domain} → {len(collections_to_search)} collection(s)")
+        # Step 1: Search all collections (no routing)
+        collections_to_search = get_all_collections()
+        domain = detect_query_domain(question)[0]  # for response metadata / primary_domain only
+        print(f"📚 Searching all collections: {len(collections_to_search)} (no routing)")
 
         if not collections_to_search:
             return {
@@ -1372,8 +1380,6 @@ class SmartLegalAssistant:
                 "searched_collections": [],
                 "query_id": query_id
             }
-
-        print(f"📚 Collections to search: {len(collections_to_search)}")
 
         # Check cache first
         cached_result = self.query_cache.get(question, collections_to_search)
@@ -1389,25 +1395,19 @@ class SmartLegalAssistant:
         search_queries = [question] + extract_section_search_queries(question)
         # print(f"📝 Generated {len(reformulated_queries)} query variants")
 
-        # Step 3: Vector search across collections (single or multi-query for section-specific retrieval)
-        print("🔍 Performing vector search across collections...")
+        # Step 3: Vector search across all collections (single or multi-query for section-specific retrieval)
+        print("🔍 Performing vector search across all collections...")
         source_docs = await self.search_collections_async(search_queries, collections_to_search, k_per_collection=10)
 
         if not source_docs:
-            # Fallback: Search all collections
-            print("⚠️  No results in targeted search. Expanding search to all collections...")
-            all_collections = get_all_collections()
-            source_docs = await self.search_collections_async([question], all_collections, k_per_collection=2)
-
-            if not source_docs:
-                no_result = {
-                    "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'\n\n💡 **Suggestions:**\n• Be more specific about your legal query\n• Check if the relevant legal documents have been uploaded\n• Specify which domain of law you're interested in (Traffic, Family, Corporate)",
-                    "source_documents": [],
-                    "searched_collections": all_collections,
-                    "query_id": query_id
-                }
-                self.query_cache.set(question, collections_to_search, no_result)
-                return no_result
+            no_result = {
+                "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'\n\n💡 **Suggestions:**\n• Be more specific about your legal query\n• Check if the relevant legal documents have been uploaded",
+                "source_documents": [],
+                "searched_collections": collections_to_search,
+                "query_id": query_id
+            }
+            self.query_cache.set(question, collections_to_search, no_result)
+            return no_result
 
         # Step 4: Use top docs directly (no reranking)
         top_n = getattr(settings, "RERANK_N", 12)
@@ -1472,11 +1472,12 @@ class SmartLegalAssistant:
         return result
 
     async def prepare_rag_for_stream(self, question: str, conversation_history: Optional[List[dict]] = None, start_time: Optional[float] = None):
-        """Run RAG (domain, search, build prompt) without calling the LLM. Returns dict with enhanced_prompt etc., or {'_cached': result} if cache hit."""
+        """Run RAG (search all collections, build prompt) without calling the LLM. Returns dict with enhanced_prompt etc., or {'_cached': result} if cache hit."""
         t0 = start_time if start_time is not None else time.time()
         query_id = str(uuid.uuid4())
-        domain, collections_to_search = detect_query_domain(question)
-        print(f"[{time.perf_counter()-t0:.2f}s] 🎯 Domain: {domain} → {len(collections_to_search)} collection(s)")
+        collections_to_search = get_all_collections()
+        domain = detect_query_domain(question)[0]  # for response metadata only
+        print(f"[{time.perf_counter()-t0:.2f}s] 📚 Searching all collections: {len(collections_to_search)} (no routing)")
         if not collections_to_search:
             return {"_early": {"result": "❌ No legal document collections found.", "source_documents": [], "searched_collections": [], "query_id": query_id}}
         cached_result = self.query_cache.get(question, collections_to_search)
@@ -1487,9 +1488,6 @@ class SmartLegalAssistant:
         print(f"[{time.perf_counter()-t0:.2f}s] 📋 Cache miss → embedding query & searching Chroma...")
         search_queries = [question] + extract_section_search_queries(question)
         source_docs = await self.search_collections_async(search_queries, collections_to_search, k_per_collection=12, start_time=t0)
-        if not source_docs:
-            all_collections = get_all_collections()
-            source_docs = await self.search_collections_async([question], all_collections, k_per_collection=6, start_time=t0)
         if not source_docs:
             no_result = {
                 "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'.",
@@ -1534,19 +1532,14 @@ class SmartLegalAssistant:
             return asyncio.run(self.__call_async(question, conversation_history))
 
     async def _get_basic_legal_context(self, question: str) -> List:
-        """Get basic legal context for decision-making before full RAG"""
+        """Get basic legal context for decision-making before full RAG (searches all collections)."""
         try:
-            # Quick domain detection
-            domain, collections_to_search = detect_query_domain(question)
-
+            collections_to_search = get_all_collections()
             if not collections_to_search:
                 return []
 
-            # Get a few documents quickly for context
-            # reformulated_queries = self.reformulation_agent.reformulate(question)
-            reformulated_queries = [question]  # Skip reformulation for now
+            reformulated_queries = [question]
             basic_docs = await self.search_collections_async(reformulated_queries[:2], collections_to_search, k_per_collection=2)
-
             return basic_docs[:5]  # Limit to 5 docs for decision-making
 
         except Exception as e:
@@ -1560,12 +1553,10 @@ class SmartLegalAssistant:
 
         print("🚀 Starting legal analysis (sync mode)...")
 
-        # Step 1: Detect domain and relevant collections (legacy method)
-        print("🧠 Analyzing query domain...")
-        domain, collections_to_search = detect_query_domain(question)
-
-        print(f"🎯 Detected Domain: {domain.upper()}")
-        print(f"📚 Collections to search: {len(collections_to_search)}")
+        # Step 1: Search all collections (no routing)
+        collections_to_search = get_all_collections()
+        domain = detect_query_domain(question)[0]  # for response metadata only
+        print(f"📚 Searching all collections: {len(collections_to_search)} (no routing)")
 
         if not collections_to_search:
             return {
@@ -1575,23 +1566,17 @@ class SmartLegalAssistant:
                 "query_id": query_id
             }
 
-        # Step 2: Search relevant collections
+        # Step 2: Search all collections
         print("🔍 Searching legal databases...")
         source_docs = self.search_collections(question, collections_to_search, k_per_collection=3)
 
         if not source_docs:
-            # Fallback: Search all collections with broader search
-            print("⚠️  No results in targeted search. Expanding search to all collections...")
-            all_collections = get_all_collections()
-            source_docs = self.search_collections(question, all_collections, k_per_collection=2)
-
-            if not source_docs:
-                return {
-                    "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'\n\n💡 **Suggestions:**\n• Be more specific about your legal query\n• Check if the relevant legal documents have been uploaded\n• Specify which domain of law you're interested in (Traffic, Family, Corporate)",
-                    "source_documents": [],
-                    "searched_collections": all_collections,
-                    "query_id": query_id
-                }
+            return {
+                "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'\n\n💡 **Suggestions:**\n• Be more specific about your legal query\n• Check if the relevant legal documents have been uploaded",
+                "source_documents": [],
+                "searched_collections": collections_to_search,
+                "query_id": query_id
+            }
 
         # Step 3: Combine legal context and generate answer
         legal_context_parts = []
