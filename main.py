@@ -1,8 +1,29 @@
+import sys
+# Force line-buffered output so request logs (print) show in the uvicorn terminal
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 from fastapi import FastAPI
 from routes.legal_route import router as legal_router
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def warmup_chroma():
+    """Warm Chroma client and embedding path so first request doesn't pay ~3s connection cost."""
+    try:
+        from agent.legal_agent import get_all_collections, embed_query
+        names = get_all_collections()
+        print(f"🔥 Chroma warmup: {len(names)} collection(s)")
+        if names:
+            embed_query("warmup")
+            print("🔥 Embedding warmup done")
+    except Exception as e:
+        print(f"⚠️ Warmup skipped: {e}")
 
 app.add_middleware(
     CORSMiddleware,

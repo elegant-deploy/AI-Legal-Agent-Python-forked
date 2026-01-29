@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Re-ingest all legal documents with BGE-M3 embeddings.
+Re-ingest all legal documents with current embedding model (e.g. gte-base on Deepinfra).
 
-This script deletes all existing collections and re-ingests all PDFs in the Laws/ directory
-using the new BGE-M3 embeddings and deterministic IDs.
+This script re-ingests all PDFs in the Laws/ directory with force=True,
+using the embedding model from settings (DEEPINFRA_EMBED_MODEL or HF_EMBED_MODEL).
 """
 
 import os
@@ -28,7 +28,7 @@ def main():
     for pdf in pdf_files:
         print(f"  - {pdf.name}")
 
-    print("\n🚀 Starting re-ingestion with BGE-M3 embeddings...")
+    print("\n🚀 Starting re-ingestion (force=True, current embed model)...")
 
     success_count = 0
     for pdf_path in pdf_files:
@@ -51,7 +51,7 @@ def main():
     print(f"{'='*60}")
 
     if success_count == len(pdf_files):
-        print("🎉 All documents re-ingested successfully with BGE-M3 embeddings!")
+        print("🎉 All documents re-ingested successfully!")
     else:
         print("⚠️ Some documents failed to re-ingest. Check the logs above.")
         sys.exit(1)

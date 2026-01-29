@@ -1,5 +1,8 @@
 import asyncio
+import json
+import time
 from agent.legal_agent import SmartLegalAssistant
+from agent.gemini_llm import gemini_llm
 from controllers.decision_controller import process_decision_query
 
 # Initialize the assistant
@@ -60,6 +63,55 @@ async def ask_legal_question(question: str, context=None):
             "success": False,
             "error": str(e)
         }
+
+
+async def ask_legal_question_stream(question: str, context=None):
+    """Run RAG then stream Gemini response. Yields SSE-style dicts: start, chunk, done.
+    If cached or early return, yields single 'result' then stops."""
+    t0 = time.perf_counter()
+    print(f"[{time.perf_counter()-t0:.2f}s] 📥 STREAM REQUEST RECEIVED")
+    try:
+        from agent.decision_agents import DecisionIntentDetectionAgent
+        from agent.legal_agent import primary_llm
+        intent_detector = DecisionIntentDetectionAgent(primary_llm)
+        intent_result = intent_detector.detect_intent(question)
+        print(f"[{time.perf_counter()-t0:.2f}s] 🎯 Intent: {intent_result['intent']} ({intent_result.get('method', '')})")
+        if intent_result["intent"] == "DECISION_MAKING":
+            decision_result = await process_decision_query(question, context)
+            if decision_result.get("success"):
+                yield {"type": "result", "success": True, "data": decision_result}
+                return
+        print(f"[{time.perf_counter()-t0:.2f}s] 📚 Starting RAG prepare (domain + retrieval + prompt)...")
+        prep = await assistant.prepare_rag_for_stream(question, context, start_time=t0)
+        if prep.get("_cached"):
+            yield {"type": "result", "success": True, "data": {"data": prep["_cached"]}}
+            return
+        if prep.get("_early"):
+            yield {"type": "result", "success": True, "data": {"data": prep["_early"]}}
+            return
+        query_id = prep["query_id"]
+        print(f"[{time.perf_counter()-t0:.2f}s] 🤖 RAG done. Calling LLM stream (prompt {len(prep['enhanced_prompt'])} chars)...")
+        yield {"type": "start", "query_id": query_id}
+        full_text = []
+        first_chunk = True
+        for chunk in gemini_llm.stream_content(prep["enhanced_prompt"], start_time=t0):
+            if first_chunk:
+                print(f"[{time.perf_counter()-t0:.2f}s] 📤 FIRST CHUNK FROM LLM (TTFT)")
+                first_chunk = False
+            full_text.append(chunk)
+            yield {"type": "chunk", "text": chunk}
+        result_text = "".join(full_text)
+        print(f"[{time.perf_counter()-t0:.2f}s] ✅ STREAM DONE (total {len(result_text)} chars)")
+        yield {
+            "type": "done",
+            "query_id": query_id,
+            "result": result_text,
+            "sources_count": len(prep["top_docs"]),
+        }
+    except Exception as e:
+        print(f"[{time.perf_counter()-t0:.2f}s] ❌ STREAM ERROR: {e}")
+        yield {"type": "error", "error": str(e)}
+
 
 def get_system_info():
     """Get information about available collections"""

@@ -100,7 +100,7 @@ class GeminiLLM(LLM):
                     prompt,
                     generation_config=genai.types.GenerationConfig(
                         temperature=0.1,
-                        max_output_tokens=4000,
+                        max_output_tokens=1024,
                         top_p=0.9,
                         top_k=40
                     )
@@ -128,6 +128,32 @@ class GeminiLLM(LLM):
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
         """Main call method with retries"""
         return self._call_with_retry(prompt, stop)
+
+    def stream_content(self, prompt: str, start_time: Optional[float] = None):
+        """Stream Gemini response in chunks. Yields str chunks. Logs TTFT when start_time given."""
+        try:
+            t0 = start_time if start_time is not None else time.time()
+            model = genai.GenerativeModel(self.model_name)
+            print(f"[{time.perf_counter()-t0:.2f}s] 🔴 LLM: Sending request to Gemini (prompt {len(prompt)} chars)...")
+            response = model.generate_content(
+                prompt,
+                stream=True,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    max_output_tokens=1024,
+                    top_p=0.9,
+                    top_k=40,
+                ),
+            )
+            first = True
+            for chunk in response:
+                if chunk.text and chunk.text.strip():
+                    if first and start_time is not None:
+                        print(f"[{time.perf_counter()-t0:.2f}s] 🔴 LLM: First token received (TTFT)")
+                        first = False
+                    yield chunk.text
+        except Exception as e:
+            yield f"\n\n[Stream error: {e}]"
 
 # Create singleton instance
 gemini_llm = GeminiLLM()

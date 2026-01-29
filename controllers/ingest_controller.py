@@ -92,6 +92,40 @@ def extract_text_with_metadata(pdf_path: str):
 
     return documents, domain, pdf_hash
 
+
+def simple_chunking(documents, chunk_size=600, chunk_overlap=100):
+    """One-pass chunking only — fewer chunks, no sliding window or semantic split."""
+    legal_separators = [
+        "\n\nSection", "\n\nArticle", "\n\nChapter", "\n\nPart", "\n\nClause",
+        "\n\n(", "\n\n1.", "\n\n2.", "\n\n3.", "\n\n4.", "\n\n5.", "\n\n6.", "\n\n7.", "\n\n8.", "\n\n9.", "\n\n10.",
+        "\n\n(a)", "\n\n(b)", "\n\n(c)", "\n\n(d)", "\n\n(e)", "\n\n(f)", "\n\n(g)", "\n\n(h)", "\n\n(i)", "\n\n(j)",
+        "\n\n", "\n", ". ", "! ", "? ", "; ", " ", ""
+    ]
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=legal_separators,
+        keep_separator=True,
+    )
+    chunks = []
+    for doc in documents:
+        doc_chunks = splitter.split_text(doc["page_content"])
+        for j, chunk in enumerate(doc_chunks):
+            if len(chunk.strip()) >= 50:
+                meta = doc["metadata"].copy()
+                meta.update({
+                    "chunk_id": j,
+                    "total_chunks_doc": len(doc_chunks),
+                    "chunk_size": len(chunk),
+                    "chunk_start_pos": j * (chunk_size - chunk_overlap),
+                    "has_section_header": any(h in chunk[:150] for h in ["Section", "Article", "Chapter", "Part", "Clause"]),
+                    "chunk_type": "primary",
+                })
+                chunks.append({"content": chunk, "metadata": meta})
+    return chunks
+
+
 def smart_chunking(documents, chunk_size=500, chunk_overlap=150):
     """Advanced sliding window chunking that preserves legal document structure and improves retrieval"""
     # Enhanced legal-specific separators for better chunking
@@ -223,6 +257,21 @@ def list_existing_collections():
         print(f"❌ Error listing collections: {e}")
         return []
 
+def get_deepinfra_embeddings(texts, api_key, model):
+    """Get embeddings from Deepinfra (OpenAI-compatible API), e.g. thenlper/gte-base."""
+    url = "https://api.deepinfra.com/v1/openai/embeddings"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": model, "input": texts if isinstance(texts, list) else [texts], "encoding_format": "float"}
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    out = [item["embedding"] for item in data["data"]]
+    return [list(map(float, emb)) for emb in out]
+
+
 def get_hf_embeddings(texts, api_key, model):
     """Get embeddings from Hugging Face Inference API"""
     try:
@@ -234,21 +283,33 @@ def get_hf_embeddings(texts, api_key, model):
         print(f"Error calling HF Inference API: {e}")
         raise
 
-def compute_embeddings(chunks, api_key, model):
-    """Compute embeddings for chunks"""
-    texts = [chunk['content'] for chunk in chunks]
+
+def compute_embeddings(chunks):
+    """Compute embeddings for chunks. Uses Deepinfra if DEEPINFRA_API_KEY set, else HF."""
+    texts = [chunk["content"] for chunk in chunks]
     print(f"🧮 Computing embeddings for {len(texts)} chunks...")
     batch_size = settings.EMBED_BATCH_SIZE
     total_batches = (len(texts) + batch_size - 1) // batch_size
     embeddings = []
 
+    use_deepinfra = getattr(settings, "DEEPINFRA_API_KEY", None) and settings.DEEPINFRA_API_KEY.strip()
+    if use_deepinfra:
+        api_key = settings.DEEPINFRA_API_KEY
+        model = getattr(settings, "DEEPINFRA_EMBED_MODEL", None) or "thenlper/gte-base"
+        print(f"   Using Deepinfra: {model}")
+        get_embs = get_deepinfra_embeddings
+    else:
+        api_key = settings.HF_API_KEY
+        model = settings.HF_EMBED_MODEL
+        print(f"   Using Hugging Face: {model}")
+        get_embs = get_hf_embeddings
+
     for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
+        batch_texts = texts[i : i + batch_size]
         batch_num = (i // batch_size) + 1
         print(f"   📤 Embedding batch {batch_num}/{total_batches} ({len(batch_texts)} texts)...")
         try:
-            batch_embs = get_hf_embeddings(batch_texts, api_key, model)
-            # Ensure embeddings are lists of floats
+            batch_embs = get_embs(batch_texts, api_key, model)
             batch_embs = [list(emb) for emb in batch_embs]
             embeddings.extend(batch_embs)
         except Exception as e:
@@ -284,12 +345,10 @@ def ingest_pdf(pdf_path: str, force: bool = False, dry_run: bool = False):
     print(f"📖 Extracting and processing text from '{pdf_path}'...")
     print(f"📄 Extracted {len(documents)} pages with text")
 
-    # Create chunks with advanced sliding window chunking for legal documents
-    chunks = smart_chunking(documents, chunk_size=450, chunk_overlap=150)
-    print(f"🔪 Created {len(chunks)} advanced chunks (avg size: {sum(len(c['content']) for c in chunks)//len(chunks) if chunks else 0} chars)")
-    print(f"   📊 Chunk types: Primary={sum(1 for c in chunks if c['metadata'].get('chunk_type')=='primary')}, "
-          f"Sliding={sum(1 for c in chunks if c['metadata'].get('chunk_type')=='sliding_window')}, "
-          f"Semantic={sum(1 for c in chunks if c['metadata'].get('chunk_type')=='semantic_split')}")
+    # Simple one-pass chunking — fewer chunks (no sliding window / semantic split)
+    chunks = simple_chunking(documents, chunk_size=600, chunk_overlap=100)
+    avg_len = sum(len(c["content"]) for c in chunks) // len(chunks) if chunks else 0
+    print(f"🔪 Created {len(chunks)} chunks (avg size: {avg_len} chars)")
 
     # Prepare data for Chroma
     documents_list = []
@@ -303,7 +362,7 @@ def ingest_pdf(pdf_path: str, force: bool = False, dry_run: bool = False):
         ids_list.append(f"{collection_name}_{pdf_hash}_{i:06d}")
 
     # Compute embeddings
-    embeddings_list = compute_embeddings(chunks, settings.HF_API_KEY, settings.HF_EMBED_MODEL)
+    embeddings_list = compute_embeddings(chunks)
 
     if dry_run:
         print(f"🔍 Dry run: Would upload {len(embeddings_list)} embeddings to collection '{collection_name}'")

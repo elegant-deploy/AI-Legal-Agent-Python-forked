@@ -9,14 +9,13 @@ from langchain_core.outputs import LLMResult
 from typing import Optional, List, Tuple
 from config.settings import settings
 from helper.token_tracker import track_token_usage_async
-from rank_bm25 import BM25Okapi
 from agent.gemini_llm import gemini_llm, perplexity_llm
-import numpy as np
 import asyncio
 import hashlib
 from functools import lru_cache
 from tenacity import retry, stop_after_attempt, wait_exponential
 import time
+import re
 import openai
 from transformers import pipeline
 from config.settings import settings
@@ -217,14 +216,18 @@ class PrimaryLLM(LLM):
 primary_llm = PrimaryLLM()
 
 # ------------------ Chroma Setup ------------------
+_chroma_client = None
+
 def create_chroma_client():
-    """Create Chroma Cloud client with direct credentials"""
-    client = chromadb.CloudClient(
-        api_key=settings.CHROMA_API_KEY,
-        tenant=settings.CHROMA_TENANT,
-        database=settings.CHROMA_DATABASE
-    )
-    return client
+    """Create or return cached Chroma Cloud client (avoids ~3s connection cost per request)."""
+    global _chroma_client
+    if _chroma_client is None:
+        _chroma_client = chromadb.CloudClient(
+            api_key=settings.CHROMA_API_KEY,
+            tenant=settings.CHROMA_TENANT,
+            database=settings.CHROMA_DATABASE
+        )
+    return _chroma_client
 
 def get_all_collections():
     """Get all available collections"""
@@ -235,6 +238,36 @@ def get_all_collections():
     except Exception as e:
         print(f"❌ Error getting collections: {e}")
         return []
+
+# Cache vector retrievers per collection
+_retriever_cache: dict = {}
+
+def embed_query(query: str):
+    """Embed the query using the same API as ingest (Deepinfra or HF) so retrieval matches stored embeddings."""
+    from controllers.ingest_controller import get_deepinfra_embeddings, get_hf_embeddings
+    use_deepinfra = getattr(settings, "DEEPINFRA_API_KEY", None) and getattr(settings, "DEEPINFRA_API_KEY", "").strip()
+    if use_deepinfra:
+        api_key = settings.DEEPINFRA_API_KEY
+        model = getattr(settings, "DEEPINFRA_EMBED_MODEL", None) or "thenlper/gte-base"
+        embs = get_deepinfra_embeddings([query], api_key, model)
+    else:
+        api_key = settings.HF_API_KEY
+        model = settings.HF_EMBED_MODEL
+        embs = get_hf_embeddings([query], api_key, model)
+    return embs[0] if embs else None
+
+def extract_section_search_queries(question: str) -> List[str]:
+    """If the user asks about a specific section (e.g. 'section 302 of PPC'), return extra short queries to improve retrieval of that chunk."""
+    extra = []
+    # Match "section N" or "Section N" or "s. N" / "sec N", optionally "of PPC/penal"
+    m = re.search(r"\bsection\s+(\d+)\b|\b(?:s\.|sec\.?)\s*(\d+)\b|\b(\d{2,4})\s*(?:of\s*)?(?:ppc|penal|pakistan\s*penal)\b", question, re.I)
+    if m:
+        num = next(g for g in m.groups() if g)
+        extra.append(f"section {num}")
+        if num not in question[:m.start()] and num not in question[m.end():]:
+            extra.append(num)  # bare number helps match "302. Qatl-i-amd" style chunks
+    return extra[:2]  # at most 2 extra queries to limit embedding calls
+
 
 def detect_query_domain(query: str) -> Tuple[str, List[str]]:
     """Detect which domain the query belongs to and return matching collections"""
@@ -269,320 +302,58 @@ def detect_query_domain(query: str) -> Tuple[str, List[str]]:
         return "general", all_collections
 
 def get_collection_retriever(collection_name: str, k: int = 4):
-    """Create a retriever for a specific collection with hybrid search capabilities"""
-    client = create_chroma_client()
+    """Create a vector-only retriever for a collection (cached per collection). Uses same embedding as ingest."""
+    cache_key = (collection_name, k)
+    if cache_key in _retriever_cache:
+        return _retriever_cache[cache_key]
 
+    client = create_chroma_client()
     try:
         collection = client.get_collection(name=collection_name)
 
-        class HybridCollectionRetriever:
+        class VectorRetriever:
             def __init__(self, collection, k=4):
                 self.collection = collection
                 self.k = k
                 self.collection_name = collection_name
-                self.bm25_index = None
-                self.documents = []
-                self.doc_ids = []
-                self._build_bm25_index()
 
-            def _build_bm25_index(self):
-                """Build BM25 index for keyword search"""
-                try:
-                    # Get all documents from collection with correct include parameters
-                    results = self.collection.get(include=['documents', 'metadatas'])
-                    if results['documents'] and results['metadatas']:
-                        self.documents = results['documents']
-                        self.doc_ids = [meta.get('doc_id', f'doc_{i}') for i, meta in enumerate(results['metadatas'])]
-                        # Tokenize documents for BM25 with better preprocessing
-                        tokenized_docs = []
-                        for doc in self.documents:
-                            # Clean and tokenize the document
-                            tokens = doc.lower().replace('\n', ' ').replace('\t', ' ').split()
-                            # Remove very short tokens and common stop words
-                            filtered_tokens = [token for token in tokens if len(token) > 2]
-                            tokenized_docs.append(filtered_tokens)
-                        self.bm25_index = BM25Okapi(tokenized_docs)
-                        print(f"Successfully built BM25 index for {self.collection_name} with {len(tokenized_docs)} documents")
-                except Exception as e:
-                    print(f"Warning: Could not build BM25 index for {self.collection_name}: {e}")
-                    self.bm25_index = None
-
-            def _keyword_search(self, query: str, top_k: int = 10):
-                """Perform enhanced BM25 keyword search with legal term extraction and exact matching"""
-                if not self.bm25_index:
+            def get_relevant_documents(self, query: str, query_embedding=None):
+                from langchain_core.documents import Document
+                query_emb = query_embedding if query_embedding is not None else embed_query(query)
+                if query_emb is None:
+                    print(f"⚠️ Query embedding failed for {self.collection_name}")
                     return []
-
-                # Enhanced legal query preprocessing
-                query_lower = query.lower()
-                import re
-
-                # Extract legal-specific terms with better patterns
-                legal_patterns = [
-                    r'section\s+(\d+)', r'article\s+(\d+)', r'clause\s+(\d+)',
-                    r'chapter\s+(\d+)', r'part\s+(\d+)', r'sub-section\s+(\d+)',
-                    r'paragraph\s+(\d+)', r'schedule\s+(\d+)'
-                ]
-
-                legal_terms = []
-                for pattern in legal_patterns:
-                    matches = re.findall(pattern, query_lower, re.IGNORECASE)
-                    for match in matches:
-                        full_match = re.search(pattern, query_lower, re.IGNORECASE)
-                        if full_match:
-                            legal_terms.append(full_match.group(0))
-
-                # Extract standalone numbers (likely section references)
-                numbers = re.findall(r'\b\d+\b', query_lower)
-                section_numbers = [num for num in numbers if len(num) <= 4]  # Section numbers are typically short
-
-                # Build comprehensive search terms
-                query_tokens = []
-                query_tokens.extend(query_lower.split())  # Original tokens
-                query_tokens.extend(legal_terms)  # Legal references
-                query_tokens.extend(section_numbers)  # Section numbers
-                query_tokens.extend([f"section {num}" for num in section_numbers])  # Section prefixes
-
-                # Add legal domain-specific terms
-                legal_keywords = ['law', 'act', 'ordinance', 'code', 'court', 'justice', 'legal', 'provision', 'ppc', 'penal', 'criminal']
-                query_tokens.extend([kw for kw in legal_keywords if kw in query_lower])
-
-                # Remove duplicates while preserving order
-                seen = set()
-                query_tokens = [x for x in query_tokens if not (x in seen or seen.add(x))]
-
-                # Remove very short tokens that aren't numbers
-                query_tokens = [token for token in query_tokens if len(token) > 1 or token.isdigit()]
-
-                # Get BM25 scores
-                bm25_scores = self.bm25_index.get_scores(query_tokens)
-                top_indices = np.argsort(bm25_scores)[::-1][:top_k]
-
-                keyword_docs = []
-                for idx in top_indices:
-                    score = bm25_scores[idx]
-                    # Dynamic threshold based on score distribution
-                    threshold = 0.01 if len(keyword_docs) < 3 else 0.1  # Lower threshold initially for recall
-                    if score > threshold:
-                        from langchain_core.documents import Document
-                        doc = Document(
-                            page_content=self.documents[idx],
-                            metadata={
-                                'doc_id': self.doc_ids[idx],
-                                'collection_name': self.collection_name,
-                                'search_score': float(score),
-                                'search_type': 'keyword',
-                                'matched_tokens': query_tokens,
-                                'legal_terms_found': legal_terms,
-                                'section_numbers': section_numbers
-                            }
-                        )
-                        keyword_docs.append(doc)
-
-                # If no results with BM25, try exact text matching as fallback
-                if not keyword_docs:
-                    exact_matches = []
-                    for idx, doc_content in enumerate(self.documents):
-                        doc_lower = doc_content.lower()
-                        # Check for exact legal term matches
-                        if any(term.lower() in doc_lower for term in legal_terms):
-                            exact_matches.append(idx)
-                        # Check for section number matches
-                        elif any(f"section {num}" in doc_lower for num in section_numbers):
-                            exact_matches.append(idx)
-                        elif any(num in doc_lower for num in section_numbers):
-                            exact_matches.append(idx)
-
-                    for idx in exact_matches[:top_k]:
-                        from langchain_core.documents import Document
-                        doc = Document(
-                            page_content=self.documents[idx],
-                            metadata={
-                                'doc_id': self.doc_ids[idx],
-                                'collection_name': self.collection_name,
-                                'search_score': 1.0,  # High score for exact matches
-                                'search_type': 'keyword_exact',
-                                'matched_tokens': query_tokens,
-                                'legal_terms_found': legal_terms,
-                                'section_numbers': section_numbers
-                            }
-                        )
-                        keyword_docs.append(doc)
-
-                return keyword_docs
-
-            def _semantic_search(self, query: str, top_k: int = 10):
-                """Perform semantic vector search using BGE-M3 with improved error handling"""
                 try:
-                    # Embed query using HF API with timeout
-                    query_emb = get_hf_embeddings([query], settings.HF_API_KEY, settings.HF_EMBED_MODEL)[0]
                     results = self.collection.query(
                         query_embeddings=[query_emb],
-                        n_results=top_k
+                        n_results=self.k,
+                        include=["documents", "metadatas"],
                     )
-
-                    documents = []
-                    if results['documents']:
-                        for doc, metadata, doc_id in zip(
-                            results['documents'][0],
-                            results['metadatas'][0],
-                            results['ids'][0]
-                        ):
-                            from langchain_core.documents import Document
-                            document = Document(
-                                page_content=doc,
+                except Exception as e:
+                    print(f"Vector search failed for {self.collection_name}: {e}")
+                    return []
+                documents = []
+                if results.get("documents") and results["documents"][0]:
+                    for doc_text, metadata, doc_id in zip(
+                        results["documents"][0],
+                        results["metadatas"][0],
+                        results["ids"][0],
+                    ):
+                        documents.append(
+                            Document(
+                                page_content=doc_text,
                                 metadata={
-                                    **metadata,
-                                    'doc_id': doc_id,
-                                    'collection_name': self.collection_name,
-                                    'search_type': 'semantic'
-                                }
+                                    **(metadata or {}),
+                                    "doc_id": doc_id,
+                                    "collection_name": self.collection_name,
+                                },
                             )
-                            documents.append(document)
-                    return documents
-                except Exception as e:
-                    print(f"Semantic search failed for {self.collection_name}: {type(e).__name__}: {str(e)}")
-                    # Don't fall back here, let the caller handle it
-                    return []
+                        )
+                return documents
 
-            def _hybrid_rerank(self, semantic_docs: List, keyword_docs: List, alpha: float = 0.5):
-                """Enhanced hybrid reranking with legal content prioritization"""
-                # Create a combined set of unique documents
-                all_docs = {}
-                doc_scores = {}
-                doc_sources = {}
-                doc_metadata = {}  # Store additional scoring metadata
-
-                # Add semantic search results with base weight
-                for doc in semantic_docs:
-                    doc_id = doc.metadata.get('doc_id')
-                    all_docs[doc_id] = doc
-                    doc_scores[doc_id] = alpha
-                    doc_sources[doc_id] = 'semantic'
-                    doc_metadata[doc_id] = {'semantic_score': alpha, 'keyword_score': 0}
-
-                # Add keyword search results with enhanced legal scoring
-                for doc in keyword_docs:
-                    doc_id = doc.metadata.get('doc_id')
-                    base_score = doc.metadata.get('search_score', 0)
-
-                    # Enhanced legal content scoring
-                    content = doc.page_content.lower()
-                    legal_boost = 0
-                    precision_boost = 0
-
-                    # Extract legal terms and section numbers from metadata
-                    legal_terms = doc.metadata.get('legal_terms_found', [])
-                    section_numbers = doc.metadata.get('section_numbers', [])
-                    matched_tokens = doc.metadata.get('matched_tokens', [])
-
-                    # Boost for exact legal term matches
-                    for term in legal_terms:
-                        if term.lower() in content:
-                            legal_boost += 0.5  # High boost for legal terms
-
-                    # Boost for section number matches
-                    for num in section_numbers:
-                        if num in content:
-                            precision_boost += 0.8  # Very high boost for section numbers
-                        # Also check for "section X" patterns
-                        if f"section {num}" in content:
-                            precision_boost += 1.0  # Maximum boost for exact section references
-
-                    # Boost for legal keywords
-                    legal_keywords = ['shall', 'provided that', 'notwithstanding', 'hereby', 'hereinafter']
-                    for keyword in legal_keywords:
-                        if keyword in content:
-                            legal_boost += 0.1
-
-                    # Calculate final keyword score
-                    keyword_score = (1 - alpha) * (base_score + legal_boost + precision_boost)
-
-                    if doc_id in all_docs:
-                        # Combine scores for documents found in both searches
-                        doc_scores[doc_id] += keyword_score
-                        doc_sources[doc_id] = 'hybrid'
-                        doc_metadata[doc_id]['keyword_score'] = keyword_score
-                        doc_metadata[doc_id]['combined_score'] = doc_scores[doc_id]
-                    else:
-                        # New document from keyword search
-                        all_docs[doc_id] = doc
-                        doc_scores[doc_id] = keyword_score
-                        doc_sources[doc_id] = 'keyword'
-                        doc_metadata[doc_id] = {
-                            'semantic_score': 0,
-                            'keyword_score': keyword_score,
-                            'combined_score': keyword_score
-                        }
-
-                # Apply legal relevance filtering - prioritize documents with legal content
-                filtered_docs = []
-                for doc_id, doc in all_docs.items():
-                    score = doc_scores[doc_id]
-                    content = doc.page_content.lower()
-
-                    # Minimum relevance threshold
-                    if score < 0.1:
-                        continue
-
-                    # Boost documents that contain legal structure indicators
-                    legal_indicators = ['section', 'article', 'clause', 'provided', 'shall', 'act', 'law', 'ordinance']
-                    legal_indicator_count = sum(1 for indicator in legal_indicators if indicator in content)
-
-                    if legal_indicator_count > 0:
-                        score += legal_indicator_count * 0.05  # Small boost for legal content
-
-                    # Update final score
-                    doc_scores[doc_id] = score
-                    doc.metadata['final_score'] = score
-                    doc.metadata['search_source'] = doc_sources[doc_id]
-                    filtered_docs.append(doc)
-
-                # Sort by final score and return top k
-                sorted_docs = sorted(filtered_docs, key=lambda x: doc_scores[x.metadata['doc_id']], reverse=True)
-                return sorted_docs[:self.k]
-
-            def get_relevant_documents(self, query):
-                """Sequential search: text/regex first, then semantic/hybrid if needed"""
-                try:
-                    # Step 1: Try keyword search (text/regex) first for speed and accuracy
-                    keyword_docs = self._keyword_search(query, top_k=self.k * 2)
-
-                    if keyword_docs:
-                        # If keyword search found results, return them (rerank if multiple)
-                        if len(keyword_docs) > self.k:
-                            # Simple reranking based on score for keyword results
-                            keyword_docs.sort(key=lambda x: x.metadata.get('search_score', 0), reverse=True)
-                        return keyword_docs[:self.k]
-
-                    # Step 2: If keyword search failed, try semantic search
-                    print(f"Keyword search found no results for {self.collection_name}, trying semantic search...")
-                    semantic_docs = self._semantic_search(query, top_k=self.k * 2)
-
-                    if semantic_docs:
-                        return semantic_docs[:self.k]
-
-                    # Step 3: If both failed, try hybrid as last resort
-                    print(f"Semantic search also failed for {self.collection_name}, attempting hybrid fallback...")
-                    # Do both searches for hybrid reranking
-                    semantic_docs = self._semantic_search(query, top_k=self.k)
-                    keyword_docs = self._keyword_search(query, top_k=self.k)
-
-                    if semantic_docs or keyword_docs:
-                        combined_docs = self._hybrid_rerank(semantic_docs, keyword_docs)
-                        return combined_docs
-
-                    return []
-
-                except Exception as e:
-                    print(f"Error in sequential search for {self.collection_name}: {e}")
-                    # Ultimate fallback: try keyword search only
-                    try:
-                        return self._keyword_search(query, top_k=self.k)
-                    except:
-                        return []
-
-        return HybridCollectionRetriever(collection, k=k)
-
+        retriever = VectorRetriever(collection, k=k)
+        _retriever_cache[cache_key] = retriever
+        return retriever
     except Exception as e:
         print(f"❌ Failed to load collection {collection_name}: {e}")
         return None
@@ -1216,121 +987,6 @@ class QueryCache:
         """Clear all cached results"""
         self.cache.clear()
 
-# ------------------ HF Inference Functions ------------------
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_hf_embeddings(texts, api_key, model):
-    """Get embeddings from Hugging Face Inference API with retry"""
-    url = f"https://api-inference.huggingface.co/embeddings/{model}"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    data = {"inputs": texts}
-    response = requests.post(url, headers=headers, json=data, timeout=60)
-    response.raise_for_status()
-    return response.json()
-
-def get_reranker_scores_batch(inputs, api_key, model):
-    """Get reranker scores from Hugging Face Inference API with fallback models"""
-    # Try multiple reranker models in order of preference (prioritizing speed)
-    models_to_try = [
-        model,  # Primary model from settings (now TinyBERT - fast and lightweight)
-        "cross-encoder/ms-marco-MiniLM-L-6-v2",  # MiniLM fallback (still lightweight)
-        "BAAI/bge-reranker-base"   # BGE base as final fallback
-    ]
-
-    for current_model in models_to_try:
-        try:
-            url = f"https://router.huggingface.co/hf-inference/models/{current_model}"
-            headers = {"Authorization": f"Bearer {api_key}"}
-            data = {"inputs": inputs}
-
-            print(f"🔄 Trying reranker model: {current_model}")
-            response = requests.post(url, headers=headers, json=data, timeout=60)
-
-            if response.status_code == 404:
-                print(f"⚠️ Model {current_model} not found (404), trying next model...")
-                continue
-            elif response.status_code != 200:
-                print(f"⚠️ Reranker API Error for {current_model}: {response.status_code} - {response.text}")
-                continue
-
-            response.raise_for_status()
-            scores = response.json()
-            print(f"✅ Successfully used reranker model: {current_model}")
-            return scores  # list of scores
-
-        except Exception as e:
-            print(f"⚠️ Error with model {current_model}: {type(e).__name__}: {str(e)}")
-            continue
-
-    # If all models fail, raise the last exception
-    raise Exception(f"All reranker models failed. Last error: {str(e) if 'e' in locals() else 'Unknown error'}")
-
-def rerank_with_bge(question, docs):
-    """Rerank documents using lightweight reranker with optimized performance"""
-    if len(docs) <= 3:
-        # For small result sets, skip reranking to avoid API calls
-        print(f"📊 Small result set ({len(docs)} docs), skipping reranking")
-        return docs
-
-    # Limit reranking to configured maximum for speed
-    max_docs_to_rerank = min(len(docs), settings.MAX_RERANK_DOCS)
-    docs_to_rerank = docs[:max_docs_to_rerank]
-
-    try:
-        inputs = []
-        for doc in docs_to_rerank:
-            # Use simpler input format for lightweight models
-            text = f"{question} [SEP] {doc.page_content[:500]}"  # Limit content length for speed
-            inputs.append(text)
-
-        print(f"🧮 Computing reranker scores for {len(inputs)} doc pairs (limited to {max_docs_to_rerank} for speed)...")
-        scores = get_reranker_scores_batch(inputs, settings.HF_API_KEY, settings.HF_RERANKER_MODEL)
-
-        # Sort docs by scores descending
-        doc_score_pairs = list(zip(docs_to_rerank, scores))
-        doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-
-        # Return reranked docs plus any remaining docs in original order
-        reranked_docs = [doc for doc, score in doc_score_pairs]
-        if len(docs) > max_docs_to_rerank:
-            reranked_docs.extend(docs[max_docs_to_rerank:])
-
-        print(f"✅ Lightweight reranking completed successfully")
-        return reranked_docs
-
-    except Exception as e:
-        print(f"⚠️ Lightweight reranker failed: {type(e).__name__}: {str(e)}")
-        print(f"📊 Falling back to keyword-based reranking")
-        # Fallback to simple keyword-based reranking
-        return _fallback_keyword_rerank(question, docs)
-
-def _fallback_keyword_rerank(question, docs):
-    """Simple keyword-based reranking as fallback when BGE fails"""
-    question_lower = question.lower()
-    question_words = set(question_lower.split())
-
-    doc_scores = []
-    for doc in docs:
-        content_lower = doc.page_content.lower()
-        score = 0
-
-        # Count exact word matches
-        for word in question_words:
-            if len(word) > 2:  # Skip very short words
-                score += content_lower.count(word)
-
-        # Boost for legal terms
-        legal_terms = ['section', 'article', 'clause', 'act', 'law', 'court', 'case', 'provision']
-        for term in legal_terms:
-            if term in content_lower:
-                score += 0.5
-
-        doc_scores.append((doc, score))
-
-    # Sort by score descending
-    doc_scores.sort(key=lambda x: x[1], reverse=True)
-    print(f"✅ Keyword-based reranking completed for {len(docs)} documents")
-    return [doc for doc, score in doc_scores]
-
 # ------------------ Smart Multi-Agent Legal Assistant ------------------
 class SmartLegalAssistant:
     def __init__(self):
@@ -1370,6 +1026,25 @@ class SmartLegalAssistant:
 """,
             input_variables=["history", "context", "question", "domain"]
         )
+
+    def _log_rag_context(self, top_docs: List, legal_context: str, max_chunk_preview: int = 280, max_context_log: int = 2400):
+        """Log what was retrieved from vector and what context is being sent to the LLM (for debugging)."""
+        print("\n" + "=" * 60)
+        print("📥 VECTOR RETRIEVED (chunks passed to LLM):")
+        for i, doc in enumerate(top_docs):
+            src = doc.metadata.get("source", doc.metadata.get("collection_name", "?"))
+            page = doc.metadata.get("page_number", "?")
+            preview = (doc.page_content or "")[:max_chunk_preview].replace("\n", " ")
+            if len(doc.page_content or "") > max_chunk_preview:
+                preview += "..."
+            print(f"   [{i+1}] source={src} page={page} ({len(doc.page_content or 0)} chars) | \"{preview}\"")
+        print("-" * 60)
+        print("📤 CONTEXT TO LLM (legal_context):")
+        if len(legal_context) <= max_context_log:
+            print(legal_context)
+        else:
+            print(legal_context[:max_context_log] + f"\n... [truncated, total {len(legal_context)} chars]")
+        print("=" * 60 + "\n")
 
     def _create_enhanced_prompt(self, history_str: str, legal_context: str, question: str, domain: str, source_docs: List) -> str:
         """Create an enhanced prompt with better context structuring and accuracy instructions"""
@@ -1473,32 +1148,21 @@ class SmartLegalAssistant:
         return enhanced_prompt
 
     def _is_inadequate_response(self, response: str) -> bool:
-        """Check if the RAG-generated response indicates failure or inadequacy"""
-        if not response or len(response.strip()) < 50:
+        """Trigger fallback only when Gemini explicitly says context is missing the info (e.g. bail query)."""
+        if not response or len(response.strip()) < 80:
             return True
 
         response_lower = response.lower()
 
-        # Check for inadequate response indicators
-        inadequate_indicators = [
-            "unable to provide information",
-            "unable to find",
-            "no relevant information",
-            "No Relevant Information",
-            "no information available",
-            "i am unable to",
-            "i apologize",
-            "sorry",
-            "cannot provide",
-            "not available in the context",
+        # Only when model clearly says "context doesn't have this" → then use knowledge fallback for useful answer
+        context_missing_indicators = [
             "the provided context does not contain",
-            "does not contain any information",
-            "i can provide information on the following sections",
-            "i can only provide information on",
-            "here are some other sections"
+            "does not contain any information about",
+            "no information about",
+            "no information available in the context",
         ]
 
-        return any(indicator in response_lower for indicator in inadequate_indicators)
+        return any(indicator in response_lower for indicator in context_missing_indicators)
 
     def _generate_knowledge_based_response(self, question: str, domain: str, history_str: str, rag_context: str = "") -> str:
         """Generate response using Gemini's knowledge when RAG response is inadequate"""
@@ -1536,21 +1200,38 @@ class SmartLegalAssistant:
         except Exception as e:
             return f"I apologize, but I'm currently unable to provide information on this legal topic. Please try again later or consult a qualified legal professional for accurate advice. Error: {str(e)}"
 
-    async def search_collections_async(self, queries: List[str], collection_names: List[str], k_per_collection: int = 3):
-        """Asynchronously search across multiple collections with multiple query formulations"""
+    async def search_collections_async(self, queries: List[str], collection_names: List[str], k_per_collection: int = 3, query_embedding=None, start_time: Optional[float] = None):
+        """Asynchronously search across multiple collections. When multiple queries (e.g. main + section number), embeds each and uses the right embedding per query."""
         all_docs = []
+        t0 = start_time if start_time is not None else time.time()
+        # One embedding per query so section-specific queries (e.g. "section 302") pull the right chunks
+        if not queries:
+            return []
+        if query_embedding is not None and not isinstance(query_embedding, list):
+            embeddings = [query_embedding] * len(queries)
+        elif len(queries) == 1:
+            print(f"[{time.perf_counter()-t0:.2f}s] 🧮 Embedding query (API call)...")
+            emb = embed_query(queries[0])
+            print(f"[{time.perf_counter()-t0:.2f}s] 🧮 Embedding done → querying Chroma...")
+            embeddings = [emb] if emb else [None]
+        else:
+            print(f"[{time.perf_counter()-t0:.2f}s] 🧮 Embedding {len(queries)} queries (parallel API calls)...")
+            loop = asyncio.get_event_loop()
+            embeddings = await asyncio.gather(*[
+                loop.run_in_executor(None, lambda q=q: embed_query(q))
+                for q in queries
+            ])
+            print(f"[{time.perf_counter()-t0:.2f}s] 🧮 Embedding done → querying Chroma...")
 
-        # Create tasks for parallel search
         search_tasks = []
-
-        for query in queries:
+        for qi, query in enumerate(queries):
+            emb = embeddings[qi] if qi < len(embeddings) else None
             for collection_name in collection_names:
                 task = asyncio.create_task(
-                    self._search_single_collection_async(collection_name, query, k_per_collection)
+                    self._search_single_collection_async(collection_name, query, k_per_collection, emb)
                 )
                 search_tasks.append(task)
 
-        # Execute all searches in parallel
         results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
         # Process results
@@ -1563,17 +1244,21 @@ class SmartLegalAssistant:
 
         # Remove duplicates based on content similarity
         unique_docs = self._deduplicate_documents(all_docs)
-
-        print(f"   🔍 Multi-query search completed: {len(unique_docs)} unique documents from {len(queries)} queries")
+        if start_time is not None:
+            print(f"[{time.perf_counter()-t0:.2f}s] 🔍 Chroma done: {len(unique_docs)} unique docs from {len(queries)} query(s)")
+        else:
+            print(f"   🔍 Multi-query search completed: {len(unique_docs)} unique documents from {len(queries)} queries")
         return unique_docs
 
-    async def _search_single_collection_async(self, collection_name: str, query: str, k: int):
-        """Search a single collection asynchronously"""
+    async def _search_single_collection_async(self, collection_name: str, query: str, k: int, query_embedding=None):
+        """Search a single collection asynchronously. Uses query_embedding if provided to avoid re-embedding."""
         try:
             retriever = get_collection_retriever(collection_name, k)
             if retriever:
+                # Pass query_embedding so we don't call embed_query again per collection
                 docs = await asyncio.get_event_loop().run_in_executor(
-                    None, retriever.get_relevant_documents, query
+                    None,
+                    lambda: retriever.get_relevant_documents(query, query_embedding),
                 )
                 print(f"   🔍 Searched: {collection_name} with '{query[:50]}...' → Found {len(docs)} documents")
                 return docs
@@ -1676,35 +1361,17 @@ class SmartLegalAssistant:
         # Traditional RAG flow (fallback or when decision-making disabled)
         print("⚖️ Using Traditional RAG Flow...")
 
-        # Step 1: Query Classification using Gemini
-        # print("🧠 Classifying query domain using Gemini...")
-        classification = self.classification_agent.classify(question)
-        domain = classification['primary_domain']
-        all_domains = classification['all_domains']
+        # Step 1: Domain detection (keyword-only, no LLM)
+        domain, collections_to_search = detect_query_domain(question)
+        print(f"🎯 Domain: {domain} → {len(collections_to_search)} collection(s)")
 
-        print(f"🎯 Classified Domain: {domain.upper()} (confidence: {classification['confidence']})")
-
-        # Get collections for all relevant domains
-        if domain == 'general':
-            # For general queries, immediately search all collections in parallel for maximum coverage
-            collections_to_search = get_all_collections()
-            print(f"📚 General query detected - searching all {len(collections_to_search)} collections in parallel")
-        else:
-            collections_to_search = []
-            for dom in all_domains:
-                domain_collections = [coll for coll in get_all_collections() if dom in coll]
-                collections_to_search.extend(domain_collections)
-
-            # Remove duplicates
-            collections_to_search = list(set(collections_to_search))
-
-            if not collections_to_search:
-                return {
-                    "result": "❌ No legal document collections found. Please ensure documents have been ingested first.",
-                    "source_documents": [],
-                    "searched_collections": [],
-                    "query_id": query_id
-                }
+        if not collections_to_search:
+            return {
+                "result": "❌ No legal document collections found. Please ensure documents have been ingested first.",
+                "source_documents": [],
+                "searched_collections": [],
+                "query_id": query_id
+            }
 
         print(f"📚 Collections to search: {len(collections_to_search)}")
 
@@ -1718,18 +1385,19 @@ class SmartLegalAssistant:
         # print("🔄 Reformulating query")
         # reformulated_queries = self.reformulation_agent.reformulate(question)
         reformulated_queries = [question]  # Skip reformulation for now
+        # For section-number queries (e.g. "section 302 of PPC"), add extra retrieval queries so the right chunk is found
+        search_queries = [question] + extract_section_search_queries(question)
         # print(f"📝 Generated {len(reformulated_queries)} query variants")
 
-        # Step 3: Parallel Multi-Query Search with enhanced retrieval
-        print("🔍 Performing enhanced hybrid search across collections...")
-        print(f"   Search queries: {reformulated_queries}")
-        source_docs = await self.search_collections_async(reformulated_queries, collections_to_search, k_per_collection=4)
+        # Step 3: Vector search across collections (single or multi-query for section-specific retrieval)
+        print("🔍 Performing vector search across collections...")
+        source_docs = await self.search_collections_async(search_queries, collections_to_search, k_per_collection=10)
 
         if not source_docs:
-            # Fallback: Search all collections with broader search
+            # Fallback: Search all collections
             print("⚠️  No results in targeted search. Expanding search to all collections...")
             all_collections = get_all_collections()
-            source_docs = await self.search_collections_async(reformulated_queries, all_collections, k_per_collection=1)
+            source_docs = await self.search_collections_async([question], all_collections, k_per_collection=2)
 
             if not source_docs:
                 no_result = {
@@ -1738,27 +1406,13 @@ class SmartLegalAssistant:
                     "searched_collections": all_collections,
                     "query_id": query_id
                 }
-                # Cache negative results too (for shorter time)
                 self.query_cache.set(question, collections_to_search, no_result)
                 return no_result
 
-        # Step 4: BGE reranking for high accuracy
-        print(f"📊 Retrieved {len(source_docs)} total documents, applying BGE reranking...")
-        if len(source_docs) > settings.TOP_K:
-            # Retrieve top_k by hybrid search, then rerank top_n
-            candidate_docs = source_docs[:settings.TOP_K]
-            reranked_docs = rerank_with_bge(question, candidate_docs)
-            top_docs = reranked_docs[:settings.RERANK_N]
-            print(f" 📊  Retrieved top {settings.TOP_K}, reranked to top {len(top_docs)} documents")
-        elif len(source_docs) > settings.RERANK_N:
-            # Rerank available docs
-            reranked_docs = rerank_with_bge(question, source_docs)
-            top_docs = reranked_docs[:settings.RERANK_N]
-            print(f" 📊  Reranked to top {len(top_docs)} documents")
-        else:
-            # For smaller result sets, use directly
-            top_docs = source_docs[:settings.RERANK_N]
-            print(f"Using top {len(top_docs)} documents directly (small result set)")
+        # Step 4: Use top docs directly (no reranking)
+        top_n = getattr(settings, "RERANK_N", 12)
+        top_docs = source_docs[:top_n]
+        print(f"📊 Using top {len(top_docs)} documents from vector search")
 
         # Step 5: Combine legal context and generate answer
         legal_context_parts = []
@@ -1771,6 +1425,7 @@ class SmartLegalAssistant:
             legal_context_parts.append(doc.page_content)
 
         legal_context = "\n\n".join(legal_context_parts)
+        self._log_rag_context(top_docs, legal_context)
         primary_domain = domain if domain != "general" else list(domains_used)[0] if domains_used else "general"
 
         # Format conversation history
@@ -1789,13 +1444,13 @@ class SmartLegalAssistant:
         )
         answer = self.llm._call(enhanced_prompt)
 
-        # Enhanced response validation - check for adequacy
-        if self._is_inadequate_response(answer) or len(answer.strip()) < 100:
-            print("⚠️ RAG content inadequate, using external resources and comprehensive legal knowledge as fallback...")
+        # Fallback only when first answer explicitly says context is missing info (e.g. bail) → get useful answer
+        if self._is_inadequate_response(answer) or len(answer.strip()) < 80:
+            print("⚠️ RAG context missing info, using knowledge fallback for useful answer...")
             answer = self._generate_knowledge_based_response(question, primary_domain, history_str, legal_context)
-            print("✅ Fallback response generated using legal knowledge")
+            print("✅ Fallback response generated")
         else:
-            print("✅ RAG response adequate, proceeding with retrieved content")
+            print("✅ RAG response adequate")
 
         # Track token usage asynchronously
         asyncio.create_task(track_token_usage_async(query_id, enhanced_prompt, answer))
@@ -1815,6 +1470,51 @@ class SmartLegalAssistant:
         print("✅ Response generated and cached successfully!")
 
         return result
+
+    async def prepare_rag_for_stream(self, question: str, conversation_history: Optional[List[dict]] = None, start_time: Optional[float] = None):
+        """Run RAG (domain, search, build prompt) without calling the LLM. Returns dict with enhanced_prompt etc., or {'_cached': result} if cache hit."""
+        t0 = start_time if start_time is not None else time.time()
+        query_id = str(uuid.uuid4())
+        domain, collections_to_search = detect_query_domain(question)
+        print(f"[{time.perf_counter()-t0:.2f}s] 🎯 Domain: {domain} → {len(collections_to_search)} collection(s)")
+        if not collections_to_search:
+            return {"_early": {"result": "❌ No legal document collections found.", "source_documents": [], "searched_collections": [], "query_id": query_id}}
+        cached_result = self.query_cache.get(question, collections_to_search)
+        if cached_result:
+            print(f"[{time.perf_counter()-t0:.2f}s] 📋 Cache HIT")
+            cached_result["query_id"] = query_id
+            return {"_cached": cached_result}
+        print(f"[{time.perf_counter()-t0:.2f}s] 📋 Cache miss → embedding query & searching Chroma...")
+        search_queries = [question] + extract_section_search_queries(question)
+        source_docs = await self.search_collections_async(search_queries, collections_to_search, k_per_collection=12, start_time=t0)
+        if not source_docs:
+            all_collections = get_all_collections()
+            source_docs = await self.search_collections_async([question], all_collections, k_per_collection=6, start_time=t0)
+        if not source_docs:
+            no_result = {
+                "result": f"**No Relevant Information Found**\n\nI've searched through all available legal documents but couldn't find specific information about: '{question}'.",
+                "source_documents": [], "searched_collections": get_all_collections(), "query_id": query_id
+            }
+            return {"_early": no_result}
+        top_n = getattr(settings, "RERANK_N", 12)
+        top_docs = source_docs[:top_n]
+        print(f"[{time.perf_counter()-t0:.2f}s] 📄 Got top {len(top_docs)} chunks ({sum(len(d.page_content) for d in top_docs)} chars total)")
+        legal_context = "\n\n".join(doc.page_content for doc in top_docs)
+        self._log_rag_context(top_docs, legal_context)
+        domains_used = set(doc.metadata.get("domain", "general") for doc in top_docs)
+        primary_domain = domain if domain != "general" else (list(domains_used)[0] if domains_used else "general")
+        history_str = "\n".join([f"{m['sender'].capitalize()}: {m['text']}" for m in conversation_history or []])
+        enhanced_prompt = self._create_enhanced_prompt(history_str, legal_context, question, primary_domain, top_docs)
+        print(f"[{time.perf_counter()-t0:.2f}s] 📝 Built prompt ({len(enhanced_prompt)} chars) → ready for LLM")
+        return {
+            "query_id": query_id,
+            "enhanced_prompt": enhanced_prompt,
+            "top_docs": top_docs,
+            "primary_domain": primary_domain,
+            "collections_to_search": collections_to_search,
+            "domain": domain,
+            "reformulated_queries": [question],
+        }
 
     def __call__(self, question: str, conversation_history: Optional[List[dict]] = None):
         """Synchronous call method for backward compatibility"""

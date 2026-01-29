@@ -42,7 +42,9 @@ class Settings:
 
         self.UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER')
 
-        # Hugging Face Embeddings and Reranker Config
+        # Embeddings: Deepinfra (for ingest now) or Hugging Face
+        self.DEEPINFRA_API_KEY = os.getenv('DEEPINFRA_API_KEY')
+        self.DEEPINFRA_EMBED_MODEL = os.getenv('DEEPINFRA_EMBED_MODEL', 'thenlper/gte-base')
         self.HF_API_KEY = os.getenv('HF_API_KEY')
         self.HF_EMBED_MODEL = os.getenv('HF_EMBED_MODEL', 'BAAI/bge-m3')
         self.HF_RERANKER_MODEL = os.getenv('HF_RERANKER_MODEL', 'cross-encoder/ms-marco-TinyBERT-L-2-v2')
