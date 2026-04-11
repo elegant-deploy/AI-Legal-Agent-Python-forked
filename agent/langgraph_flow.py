@@ -223,8 +223,6 @@ class LegalDecisionFlow:
 
 {advice}
 
----
-**Processing Details:** Context used: {metadata.get('context_used', 0)} documents | Method: {metadata.get('method', 'unknown')}
 """
 
         else:
@@ -242,8 +240,6 @@ class LegalDecisionFlow:
 
 {rag_response}
 
----
-**Processing Details:** {metadata.get('source_documents', 0)} source documents | {metadata.get('searched_collections', 0)} collections searched
 """
 
         return {

@@ -1035,20 +1035,20 @@ class SmartLegalAssistant:
         """Log what was retrieved from vector and what context is being sent to the LLM (for debugging)."""
         print("\n" + "=" * 60)
         print("📥 VECTOR RETRIEVED (chunks passed to LLM):")
-        for i, doc in enumerate(top_docs):
-            src = doc.metadata.get("source", doc.metadata.get("collection_name", "?"))
-            page = doc.metadata.get("page_number", "?")
-            preview = (doc.page_content or "")[:max_chunk_preview].replace("\n", " ")
-            if len(doc.page_content or "") > max_chunk_preview:
-                preview += "..."
-            print(f"   [{i+1}] source={src} page={page} ({len(doc.page_content or 0)} chars) | \"{preview}\"")
+        # for i, doc in enumerate(top_docs):
+        #     src = doc.metadata.get("source", doc.metadata.get("collection_name", "?"))
+        #     page = doc.metadata.get("page_number", "?")
+        #     preview = (doc.page_content or "")[:max_chunk_preview].replace("\n", " ")
+        #     if len(doc.page_content or "") > max_chunk_preview:
+        #         preview += "..."
+        #     print(f"   [{i+1}] source={src} page={page} ({len(doc.page_content or 0)} chars) | \"{preview}\"")
         print("-" * 60)
         print("📤 CONTEXT TO LLM (legal_context):")
-        if len(legal_context) <= max_context_log:
-            print(legal_context)
-        else:
-            print(legal_context[:max_context_log] + f"\n... [truncated, total {len(legal_context)} chars]")
-        print("=" * 60 + "\n")
+        # if len(legal_context) <= max_context_log:
+        #     print(legal_context)
+        # else:
+        #     print(legal_context[:max_context_log] + f"\n... [truncated, total {len(legal_context)} chars]")
+        # print("=" * 60 + "\n")
 
     def _create_enhanced_prompt(self, history_str: str, legal_context: str, question: str, domain: str, source_docs: List) -> str:
         """Create an enhanced prompt with better context structuring and accuracy instructions"""
@@ -1338,8 +1338,6 @@ class SmartLegalAssistant:
 
 {decision_result.get('decision_advice', 'Unable to generate decision-making advice at this time.')}
 
----
-**Processing Details:** Context used: {decision_result.get('context_used', 0)} documents | Method: {decision_result.get('method', 'structured_decision_making')}
 """
 
                     result = {
