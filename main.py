@@ -35,7 +35,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "Legal Assistant API is running"}
+    return {"message": "Welcome to Legal Assistant API v1.1.0"}
 
 @app.get("/health")
 async def health_check():
@@ -46,6 +46,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Legal Document Assistant API",
+        "version": "1.1.0"
     }
 
 app.include_router(legal_router, prefix="/legal", tags=["legal"])
