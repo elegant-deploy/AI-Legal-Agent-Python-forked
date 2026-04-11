@@ -17,7 +17,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import time
 import re
 import openai
-from transformers import pipeline
 from config.settings import settings
 
 # ------------------ OpenRouter Config ------------------
@@ -367,7 +366,10 @@ class QueryReformulationAgent:
     def __init__(self, llm):
         self.llm = llm
         # Initialize T5-small for fast, free reformulation
+        self.t5_reformulator = None
         try:
+            from transformers import pipeline
+
             self.t5_reformulator = pipeline(
                 "text2text-generation",
                 model="google/flan-t5-small",
