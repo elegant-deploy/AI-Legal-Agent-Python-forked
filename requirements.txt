@@ -27,6 +27,7 @@ frozenlist==1.8.0
 fsspec==2025.3.0
 google-auth==2.41.1
 google-generativeai==0.8.6
+google-ai-generativelanguage==0.6.15
 googleapis-common-protos==1.71.0
 greenlet==3.2.4
 grpcio==1.75.1
@@ -80,7 +81,7 @@ packaging==25.0
 pillow==12.0.0
 posthog==5.4.0
 propcache==0.4.1
-protobuf==6.33.0
+protobuf==5.29.5
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pybase64==1.4.2
