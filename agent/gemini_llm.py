@@ -68,10 +68,17 @@ import asyncio
 
 
 # Uncommented Gemini code
-from google import genai
-from google.genai import types
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning, module='google.generativeai')
+import google.generativeai as genai
+from langchain_core.language_models import LLM
+from typing import Optional, List
+from config.settings import settings
+import time
+import asyncio
 
-gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+# Configure Gemini API
+genai.configure(api_key=settings.GEMINI_API_KEY)
 
 class GeminiLLM(LLM):
     """Gemini LLM wrapper with retry logic"""
@@ -90,15 +97,15 @@ class GeminiLLM(LLM):
             try:
                 print(f"🔴 Calling Gemini API (attempt {attempt + 1}/{self.max_retries})...")
 
-                response = gemini_client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
+                model = genai.GenerativeModel(self.model_name)
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
                         temperature=0.1,
                         max_output_tokens=1024,
                         top_p=0.9,
-                        top_k=40,
-                    ),
+                        top_k=40
+                    )
                 )
 
                 if response.text and response.text.strip():
@@ -128,11 +135,12 @@ class GeminiLLM(LLM):
         """Stream Gemini response in chunks. Yields str chunks. Logs TTFT when start_time given."""
         try:
             t0 = start_time if start_time is not None else time.time()
+            model = genai.GenerativeModel(self.model_name)
             print(f"[{time.perf_counter()-t0:.2f}s] 🔴 LLM: Sending request to Gemini (prompt {len(prompt)} chars)...")
-            response = gemini_client.models.generate_content_stream(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
+            response = model.generate_content(
+                prompt,
+                stream=True,
+                generation_config=genai.types.GenerationConfig(
                     temperature=0.1,
                     max_output_tokens=1024,
                     top_p=0.9,
