@@ -376,6 +376,8 @@ class QueryReformulationAgent:
                 device=-1  # Use CPU for compatibility, can be changed to 0 for GPU
             )
             print("T5-small reformulator loaded successfully")
+        except ModuleNotFoundError:
+            self.t5_reformulator = None
         except Exception as e:
             print(f"Warning: Failed to load T5-small: {e}. Falling back to LLM.")
             self.t5_reformulator = None
