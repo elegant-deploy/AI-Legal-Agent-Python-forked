@@ -212,14 +212,7 @@ class LegalDecisionFlow:
             advice = state.get("decision_advice", "")
             metadata = state.get("metadata", {})
 
-            final_response = f"""# 🤖 **Legal Decision-Making Assistant**
-
-## 📋 **Query Analysis**
-**Intent Detected:** {intent_result.get('intent', 'UNKNOWN')}
-**Confidence:** {intent_result.get('confidence', 'UNKNOWN')}
-**Method:** {intent_result.get('method', 'unknown')}
-
-## 💡 **Decision-Making Advice**
+            final_response = f"""# **Legal Decision-Making Assistant**
 
 {advice}
 
